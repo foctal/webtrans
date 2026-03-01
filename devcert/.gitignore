@@ -1,0 +1,4 @@
+*.crt
+*.hex
+*.key
+*.fingerprint

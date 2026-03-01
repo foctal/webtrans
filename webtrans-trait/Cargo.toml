@@ -1,0 +1,17 @@
+[package]
+name = "webtrans-trait"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Async WebTransport trait for webtrans transports."
+repository = "https://github.com/foctal/webtrans"
+readme = "../README.md"
+keywords = ["network", "webtransport"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+bytes = { workspace = true }
+
+[dev-dependencies]
+futures = "0.3"

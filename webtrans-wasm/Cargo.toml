@@ -1,0 +1,49 @@
+[package]
+name = "webtrans-wasm"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebTransport wrapper for WebAssembly."
+repository = "https://github.com/foctal/webtrans"
+readme = "../README.md"
+keywords = ["network", "webtransport", "wasm"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[package.metadata.docs.rs]
+targets = ["wasm32-unknown-unknown"]
+rustc-args = ["--cfg=web_sys_unstable_apis"]
+rustdoc-args = ["--cfg=web_sys_unstable_apis"]
+
+[dependencies]
+bytes = { workspace = true }
+futures-io = "0.3"
+js-sys = "0.3.88"
+thiserror = { workspace = true }
+url = { workspace = true }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-streams = "0.1.2"
+webtrans-trait = { workspace = true }
+
+[dependencies.web-sys]
+version = "0.3.88"
+features = [
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
+    "WebTransport",
+    "WebTransportHash",
+    "WebTransportOptions",
+    "WebTransportBidirectionalStream",
+    "WebTransportCloseInfo",
+    "WebTransportSendStream",
+    "WebTransportReceiveStream",
+    "WebTransportDatagramDuplexStream",
+    "WebTransportCongestionControl",
+    "WebTransportError",
+    "WebTransportErrorSource",
+    "WebTransportErrorOptions",
+    "WritableStream",
+    "WritableStreamDefaultWriter",
+]

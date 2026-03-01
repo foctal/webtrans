@@ -1,0 +1,39 @@
+[package]
+name = "webtrans"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebTransport library for native and WebAssembly"
+repository = "https://github.com/foctal/webtrans"
+readme = "../README.md"
+keywords = ["network", "webtransport", "native", "wasm"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+webtrans-proto = { workspace = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+webtrans-quinn = { workspace = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+webtrans-wasm = { workspace = true }
+
+[dev-dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
+rustls-pemfile = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = "0.3"
+ring = "0.17"
+url = { workspace = true }
+
+[[example]]
+name = "echo-client"
+path = "examples/echo-client.rs"
+
+[[example]]
+name = "echo-server"
+path = "examples/echo-server.rs"

@@ -1,0 +1,3 @@
+#[target.wasm32-unknown-unknown]
+[target.'cfg(all())']
+rustflags = ["--cfg=web_sys_unstable_apis"]

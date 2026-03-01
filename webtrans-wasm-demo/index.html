@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>webtrans-wasm-demo</title>
+    <style>
+      body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, Arial; padding: 16px; }
+      .row { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+      input { padding: 8px; min-width: 360px; }
+      button { padding: 8px 12px; }
+      pre { background: #111; color: #ddd; padding: 12px; border-radius: 8px; min-height: 240px; overflow: auto; }
+      small { color: #666; }
+    </style>
+  </head>
+  <body>
+    <h1>webtrans-wasm-demo</h1>
+
+    <div class="row">
+      <input id="url" value="https://localhost:4443/" />
+    </div>
+
+    <div class="row">
+      <input id="cert-hash" placeholder="server cert sha256 (hex). e.g. a76166... (colons/spaces OK)" />
+    </div>
+
+    <div class="row">
+      <button id="btn-connect-system">connect (system roots)</button>
+      <button id="btn-connect-pin">connect (pin cert hash)</button>
+      <button id="btn-close">close</button>
+    </div>
+
+    <div class="row">
+      <button id="btn-bistream">open_bi echo</button>
+      <button id="btn-dgram">datagram echo</button>
+    </div>
+
+    <small>
+      Tip: If Chrome blocks QUIC certs, using "pin cert hash" often works (see MDN serverCertificateHashes).
+    </small>
+
+    <h3>log</h3>
+    <pre id="log"></pre>
+
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+  </body>
+</html>

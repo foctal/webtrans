@@ -1,0 +1,29 @@
+[package]
+name = "webtrans-proto"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "WebTransport protocol primitives shared across webtrans transports."
+repository = "https://github.com/foctal/webtrans"
+readme = "../README.md"
+keywords = ["network", "webtransport"]
+categories = ["network-programming", "web-programming"]
+license = "MIT"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+http = { workspace = true }
+url = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[dev-dependencies]
+criterion = "0.8"
+
+[[bench]]
+name = "varint"
+harness = false
+
+[[bench]]
+name = "protocol"
+harness = false
