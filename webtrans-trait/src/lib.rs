@@ -87,6 +87,8 @@ pub trait SendStream: MaybeSend {
     type Error: Error;
 
     /// Write some of the buffer to the stream.
+    ///
+    /// Implementations must not return `Ok(0)` when `buf` is non-empty.
     fn write(&mut self, buf: &[u8])
     -> impl Future<Output = Result<usize, Self::Error>> + MaybeSend;
 
@@ -98,6 +100,14 @@ pub trait SendStream: MaybeSend {
         async move {
             let chunk = buf.chunk();
             let size = self.write(chunk).await?;
+            assert!(
+                size > 0 || chunk.is_empty(),
+                "SendStream::write returned zero for a non-empty buffer"
+            );
+            assert!(
+                size <= chunk.len(),
+                "SendStream::write returned more bytes than provided"
+            );
             buf.advance(size);
             Ok(size)
         }
@@ -109,10 +119,8 @@ pub trait SendStream: MaybeSend {
         chunk: Bytes,
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         async move {
-            // Avoid a mutable binding for the argument.
             let mut c = chunk;
-            self.write_buf(&mut c).await?;
-            Ok(())
+            self.write_all_buf(&mut c).await
         }
     }
 
@@ -124,7 +132,16 @@ pub trait SendStream: MaybeSend {
         async move {
             let mut pos = 0;
             while pos < buf.len() {
-                pos += self.write(&buf[pos..]).await?;
+                let written = self.write(&buf[pos..]).await?;
+                assert!(
+                    written > 0,
+                    "SendStream::write returned zero for a non-empty buffer"
+                );
+                assert!(
+                    written <= buf.len() - pos,
+                    "SendStream::write returned more bytes than provided"
+                );
+                pos += written;
             }
             Ok(())
         }
@@ -137,7 +154,11 @@ pub trait SendStream: MaybeSend {
     ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend {
         async move {
             while buf.has_remaining() {
-                self.write_buf(buf).await?;
+                let written = self.write_buf(buf).await?;
+                assert!(
+                    written > 0,
+                    "SendStream::write returned zero for a non-empty buffer"
+                );
             }
             Ok(())
         }
@@ -201,15 +222,22 @@ pub trait RecvStream: MaybeSend {
         buf: &mut B,
     ) -> impl Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend {
         async move {
-            let dst = unsafe {
-                std::mem::transmute::<&mut bytes::buf::UninitSlice, &mut [u8]>(buf.chunk_mut())
-            };
-            let size = match self.read(dst).await? {
+            // Use initialized temporary storage so a faulty third-party RecvStream
+            // implementation cannot turn uninitialized memory into a safe byte slice.
+            let capacity = buf.chunk_mut().len().min(8 * 1024);
+            if capacity == 0 {
+                return Ok(Some(0));
+            }
+            let mut dst = vec![0; capacity];
+            let size = match self.read(&mut dst).await? {
                 Some(size) => size,
                 None => return Ok(None),
             };
-
-            unsafe { buf.advance_mut(size) };
+            assert!(
+                size <= dst.len(),
+                "RecvStream::read returned more bytes than the provided buffer"
+            );
+            buf.put_slice(&dst[..size]);
 
             Ok(Some(size))
         }
@@ -273,7 +301,7 @@ pub trait RecvStream: MaybeSend {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, MaybeSend, RecvStream};
+    use super::{Error, RecvStream, SendStream};
     use bytes::{Bytes, BytesMut};
     use futures::executor::block_on;
     use std::fmt;
@@ -312,32 +340,51 @@ mod tests {
     impl RecvStream for TestRecvStream {
         type Error = TestError;
 
-        fn read(
-            &mut self,
-            dst: &mut [u8],
-        ) -> impl std::future::Future<Output = Result<Option<usize>, Self::Error>> + MaybeSend
-        {
-            async move {
-                let available = self.data.len().saturating_sub(self.pos);
-                if available == 0 {
-                    return Ok(None);
-                }
-
-                let size = available.min(dst.len());
-                let end = self.pos + size;
-                dst[..size].copy_from_slice(&self.data[self.pos..end]);
-                self.pos = end;
-
-                Ok(Some(size))
+        async fn read(&mut self, dst: &mut [u8]) -> Result<Option<usize>, Self::Error> {
+            let available = self.data.len().saturating_sub(self.pos);
+            if available == 0 {
+                return Ok(None);
             }
+
+            let size = available.min(dst.len());
+            let end = self.pos + size;
+            dst[..size].copy_from_slice(&self.data[self.pos..end]);
+            self.pos = end;
+
+            Ok(Some(size))
         }
 
         fn stop(&mut self, _code: u32) {}
 
-        fn closed(
-            &mut self,
-        ) -> impl std::future::Future<Output = Result<(), Self::Error>> + MaybeSend {
-            async { Ok(()) }
+        async fn closed(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+
+    struct PartialSendStream {
+        data: Vec<u8>,
+        max_write: usize,
+    }
+
+    impl SendStream for PartialSendStream {
+        type Error = TestError;
+
+        async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
+            let size = buf.len().min(self.max_write);
+            self.data.extend_from_slice(&buf[..size]);
+            Ok(size)
+        }
+
+        fn set_priority(&mut self, _order: u8) {}
+
+        fn finish(&mut self) -> Result<(), Self::Error> {
+            Ok(())
+        }
+
+        fn reset(&mut self, _code: u32) {}
+
+        async fn closed(&mut self) -> Result<(), Self::Error> {
+            Ok(())
         }
     }
 
@@ -363,5 +410,16 @@ mod tests {
         let size = block_on(stream.read_buf(&mut buf)).unwrap().unwrap();
         assert_eq!(size, 4);
         assert_eq!(&buf[..], b"test");
+    }
+
+    #[test]
+    fn write_chunk_retries_partial_writes() {
+        let mut stream = PartialSendStream {
+            data: Vec::new(),
+            max_write: 2,
+        };
+
+        block_on(stream.write_chunk(Bytes::from_static(b"hello"))).unwrap();
+        assert_eq!(stream.data, b"hello");
     }
 }
