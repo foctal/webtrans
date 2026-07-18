@@ -59,9 +59,7 @@ impl Session {
     /// Create a new bidirectional stream.
     pub async fn open_bi(&self) -> Result<(SendStream, RecvStream), Error> {
         let stream: WebTransportBidirectionalStream =
-            JsFuture::from(self.inner.create_bidirectional_stream())
-                .await?
-                .into();
+            JsFuture::from(self.inner.create_bidirectional_stream()).await?;
 
         let send = SendStream::new(stream.writable())?;
         let recv = RecvStream::new(stream.readable())?;
@@ -72,9 +70,7 @@ impl Session {
     /// Create a new unidirectional stream.
     pub async fn open_uni(&self) -> Result<SendStream, Error> {
         let stream: WebTransportSendStream =
-            JsFuture::from(self.inner.create_unidirectional_stream())
-                .await?
-                .into();
+            JsFuture::from(self.inner.create_unidirectional_stream()).await?;
 
         let send = SendStream::new(stream)?;
         Ok(send)
@@ -90,7 +86,10 @@ impl Session {
     /// Receive a datagram over the network.
     pub async fn recv_datagram(&self) -> Result<Bytes, Error> {
         let mut reader = Reader::new(&self.inner.datagrams().readable())?;
-        let data: Uint8Array = reader.read().await?.unwrap_or_default();
+        let data: Uint8Array = match reader.read().await? {
+            Some(data) => data,
+            None => return Err(self.closed().await),
+        };
         Ok(data.to_vec().into())
     }
 
@@ -104,22 +103,16 @@ impl Session {
 
     /// Block until the session closes and return the error.
     pub async fn closed(&self) -> Error {
-        self.closed_inner().await.unwrap_err()
-    }
-
-    async fn closed_inner(&self) -> Result<(), Error> {
-        let info: WebTransportCloseInfo = JsFuture::from(self.inner.closed()).await?.into();
-        let reason = info.get_reason().unwrap_or_default();
-
-        let options = web_sys::WebTransportErrorOptions::new();
-        options.set_source(web_sys::WebTransportErrorSource::Session);
-
-        if let Ok(code) = info.get_close_code().map(u8::try_from).transpose() {
-            options.set_stream_error_code(code);
+        match JsFuture::from(self.inner.closed()).await {
+            Ok(info) => {
+                let info: WebTransportCloseInfo = info;
+                Error::SessionClosed {
+                    code: info.get_close_code().unwrap_or_default(),
+                    reason: info.get_reason().unwrap_or_default(),
+                }
+            }
+            Err(error) => error.into(),
         }
-
-        let err = web_sys::WebTransportError::new_with_message_and_options(&reason, &options)?;
-        Err(Error::Session(err))
     }
 
     /// Return the URL used to create the session.

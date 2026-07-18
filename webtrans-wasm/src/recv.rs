@@ -137,11 +137,11 @@ impl RecvStream {
     }
 
     fn error_unavailable() -> io::Error {
-        io::Error::new(io::ErrorKind::Other, "reader is unavailable")
+        io::Error::other("reader is unavailable")
     }
 
     fn to_io_error(error: Error) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, error.to_string())
+        io::Error::other(error.to_string())
     }
 }
 
