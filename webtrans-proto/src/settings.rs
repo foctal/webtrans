@@ -10,11 +10,11 @@ use std::{
 use bytes::{Buf, BufMut, BytesMut};
 
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{Frame, UniStream, VarInt, VarIntUnexpectedEnd};
 use crate::grease::is_grease_value;
-use crate::io::read_incremental;
+const MAX_SETTINGS_FRAME_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 /// HTTP/3 SETTINGS identifier.
@@ -57,6 +57,7 @@ impl Debug for Setting {
                 write!(f, "WEBTRANSPORT_MAX_SESSIONS_DEPRECATED")
             }
             Setting::WEBTRANSPORT_MAX_SESSIONS => write!(f, "WEBTRANSPORT_MAX_SESSIONS"),
+            Setting::WT_ENABLED => write!(f, "WT_ENABLED"),
             x if x.is_grease() => write!(f, "GREASE SETTING [{:x?}]", x.0.into_inner()),
             x => write!(f, "UNKNOWN_SETTING [{:x?}]", x.0.into_inner()),
         }
@@ -94,6 +95,8 @@ impl Setting {
     // Current way to enable WebTransport.
     /// Current WebTransport maximum sessions setting.
     pub const WEBTRANSPORT_MAX_SESSIONS: Setting = Setting::from_u32(0xc671706a);
+    /// WebTransport over HTTP/3 draft-16 enable flag.
+    pub const WT_ENABLED: Setting = Setting::from_u32(0x2c7cf000);
 }
 
 #[derive(Error, Debug, Clone)]
@@ -114,6 +117,18 @@ pub enum SettingsError {
     /// Invalid varint or truncated settings pair inside a frame payload.
     #[error("invalid size")]
     InvalidSize,
+
+    /// A SETTINGS identifier occurred more than once in the same frame.
+    #[error("duplicate setting {0:?}")]
+    DuplicateSetting(Setting),
+
+    /// A boolean SETTINGS value was neither zero nor one.
+    #[error("invalid value {1} for setting {0:?}")]
+    InvalidValue(Setting, VarInt),
+
+    /// SETTINGS frame exceeded the implementation's bounded decode limit.
+    #[error("SETTINGS frame exceeds the 16 KiB implementation limit")]
+    MessageTooLong,
 
     /// I/O error while reading or writing the SETTINGS exchange.
     #[error("io error: {0}")]
@@ -151,6 +166,20 @@ impl Settings {
             let value = VarInt::decode(&mut data).map_err(|_| SettingsError::InvalidSize)?;
             // Only retain non-GREASE entries.
             if !id.is_grease() {
+                if settings.0.contains_key(&id) {
+                    return Err(SettingsError::DuplicateSetting(id));
+                }
+                if matches!(
+                    id,
+                    Setting::ENABLE_CONNECT_PROTOCOL
+                        | Setting::ENABLE_DATAGRAM
+                        | Setting::ENABLE_DATAGRAM_DEPRECATED
+                        | Setting::WEBTRANSPORT_ENABLE_DEPRECATED
+                        | Setting::WT_ENABLED
+                ) && value.into_inner() > 1
+                {
+                    return Err(SettingsError::InvalidValue(id, value));
+                }
                 settings.0.insert(id, value);
             }
         }
@@ -160,13 +189,44 @@ impl Settings {
 
     /// Read and decode one SETTINGS exchange from an async stream.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, SettingsError> {
-        read_incremental(
-            stream,
-            |cursor| Self::decode(cursor),
-            |err| matches!(err, SettingsError::UnexpectedEnd),
-            SettingsError::UnexpectedEnd,
-        )
-        .await
+        let stream_type = VarInt::read(stream)
+            .await
+            .map_err(|_| SettingsError::UnexpectedEnd)?;
+        let stream_type = UniStream(stream_type);
+        if stream_type != UniStream::CONTROL {
+            return Err(SettingsError::UnexpectedStreamType(stream_type));
+        }
+
+        loop {
+            let typ = VarInt::read(stream)
+                .await
+                .map_err(|_| SettingsError::UnexpectedEnd)?;
+            let length = VarInt::read(stream)
+                .await
+                .map_err(|_| SettingsError::UnexpectedEnd)?;
+            let length =
+                usize::try_from(length.into_inner()).map_err(|_| SettingsError::MessageTooLong)?;
+            if length > MAX_SETTINGS_FRAME_SIZE {
+                return Err(SettingsError::MessageTooLong);
+            }
+
+            let mut payload = vec![0; length];
+            stream.read_exact(&mut payload).await?;
+            let typ = Frame(typ);
+            if typ.is_grease() {
+                continue;
+            }
+
+            let mut frame =
+                Vec::with_capacity(stream_type.0.size() + typ.0.size() + VarInt::MAX_SIZE + length);
+            stream_type.encode(&mut frame);
+            typ.encode(&mut frame);
+            VarInt::try_from(length)
+                .map_err(|_| SettingsError::MessageTooLong)?
+                .encode(&mut frame);
+            frame.extend_from_slice(&payload);
+            return Self::decode(&mut frame.as_slice());
+        }
     }
 
     /// Encode this settings map as a control stream prefix followed by a SETTINGS frame.
@@ -209,6 +269,7 @@ impl Settings {
         self.insert(Setting::ENABLE_CONNECT_PROTOCOL, VarInt::from_u32(1));
         self.insert(Setting::ENABLE_DATAGRAM, VarInt::from_u32(1));
         self.insert(Setting::ENABLE_DATAGRAM_DEPRECATED, VarInt::from_u32(1));
+        self.insert(Setting::WT_ENABLED, VarInt::from_u32(1));
         self.insert(Setting::WEBTRANSPORT_MAX_SESSIONS, max);
 
         if include_deprecated {
@@ -224,6 +285,15 @@ impl Settings {
     // Return the maximum number of sessions supported.
     /// Return the peer-advertised maximum number of WebTransport sessions, or `0` when unsupported.
     pub fn supports_webtransport(&self) -> u64 {
+        let enabled = self
+            .get(&Setting::WT_ENABLED)
+            .map(|value| value.into_inner());
+        if enabled == Some(1)
+            && self.get(&Setting::ENABLE_DATAGRAM).map(|v| v.into_inner()) == Some(1)
+        {
+            return 1;
+        }
+
         // Observed from Chrome 114.0.5735.198 (July 19, 2023).
         // Setting(1): 65536,              // qpack_max_table_capacity
         // Setting(6): 16384,              // max_field_section_size
@@ -264,6 +334,26 @@ impl Settings {
             .unwrap_or(1)
     }
 
+    /// Return whether settings received from a server satisfy current
+    /// WebTransport negotiation requirements.
+    pub fn supports_webtransport_server(&self) -> bool {
+        (self.get(&Setting::WT_ENABLED).map(|v| v.into_inner()) == Some(1)
+            && self
+                .get(&Setting::ENABLE_CONNECT_PROTOCOL)
+                .map(|v| v.into_inner())
+                == Some(1)
+            && self.get(&Setting::ENABLE_DATAGRAM).map(|v| v.into_inner()) == Some(1))
+            || (self.supports_webtransport() > 0 && self.get(&Setting::WT_ENABLED).is_none())
+    }
+
+    /// Return whether settings received from a client satisfy current
+    /// WebTransport draft negotiation requirements.
+    pub fn supports_webtransport_client(&self) -> bool {
+        (self.get(&Setting::WT_ENABLED).map(|v| v.into_inner()) == Some(1)
+            && self.get(&Setting::ENABLE_DATAGRAM).map(|v| v.into_inner()) == Some(1))
+            || (self.supports_webtransport() > 0 && self.get(&Setting::WT_ENABLED).is_none())
+    }
+
     fn payload_len(&self) -> usize {
         self.0
             .iter()
@@ -293,5 +383,69 @@ impl Deref for Settings {
 impl DerefMut for Settings {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_settings_enable_webtransport() {
+        let mut settings = Settings::default();
+        settings.enable_webtransport_latest(1);
+
+        assert_eq!(settings.supports_webtransport(), 1);
+        assert_eq!(
+            settings.get(&Setting::WT_ENABLED),
+            Some(&VarInt::from_u32(1))
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_settings() {
+        let mut data = Vec::new();
+        UniStream::CONTROL.encode(&mut data);
+        Frame::SETTINGS.encode(&mut data);
+        VarInt::from_u32(4).encode(&mut data);
+        Setting::ENABLE_DATAGRAM.encode(&mut data);
+        VarInt::from_u32(1).encode(&mut data);
+        Setting::ENABLE_DATAGRAM.encode(&mut data);
+        VarInt::from_u32(1).encode(&mut data);
+
+        let error = Settings::decode(&mut data.as_slice()).unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::DuplicateSetting(Setting::ENABLE_DATAGRAM)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_boolean_enabled_value() {
+        let mut data = Vec::new();
+        UniStream::CONTROL.encode(&mut data);
+        Frame::SETTINGS.encode(&mut data);
+        VarInt::from_u32(5).encode(&mut data);
+        Setting::WT_ENABLED.encode(&mut data);
+        VarInt::from_u32(2).encode(&mut data);
+
+        let error = Settings::decode(&mut data.as_slice()).unwrap_err();
+        assert!(matches!(
+            error,
+            SettingsError::InvalidValue(Setting::WT_ENABLED, _)
+        ));
+    }
+
+    #[test]
+    fn server_settings_require_extended_connect() {
+        let mut settings = Settings::default();
+        settings.insert(Setting::WT_ENABLED, VarInt::from_u32(1));
+        settings.insert(Setting::ENABLE_DATAGRAM, VarInt::from_u32(1));
+
+        assert!(settings.supports_webtransport_client());
+        assert!(!settings.supports_webtransport_server());
+
+        settings.insert(Setting::ENABLE_CONNECT_PROTOCOL, VarInt::from_u32(1));
+        assert!(settings.supports_webtransport_server());
     }
 }

@@ -30,21 +30,24 @@ impl Frame {
     pub fn read<B: Buf>(
         buf: &mut B,
     ) -> Result<(Frame, bytes::buf::Take<&mut B>), VarIntUnexpectedEnd> {
-        let typ = Frame::decode(buf)?;
-        let size = VarInt::decode(buf)?;
+        loop {
+            let typ = Frame::decode(buf)?;
+            let size = VarInt::decode(buf)?;
+            let size = usize::try_from(size.into_inner()).map_err(|_| VarIntUnexpectedEnd)?;
 
-        let mut limit = Buf::take(buf, size.into_inner() as usize);
-        if limit.remaining() < limit.limit() {
-            return Err(VarIntUnexpectedEnd);
+            if buf.remaining() < size {
+                return Err(VarIntUnexpectedEnd);
+            }
+
+            // Ignore GREASE frames iteratively so an attacker cannot cause
+            // unbounded recursion with a long sequence of empty frames.
+            if typ.is_grease() {
+                buf.advance(size);
+                continue;
+            }
+
+            return Ok((typ, Buf::take(buf, size)));
         }
-
-        // Retry if this is a GREASE frame that must be ignored.
-        if typ.is_grease() {
-            limit.advance(limit.limit());
-            return Self::read(limit.into_inner());
-        }
-
-        Ok((typ, limit))
     }
 
     /// Build a frame type from a known `u32` value.

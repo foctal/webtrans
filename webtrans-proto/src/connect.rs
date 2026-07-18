@@ -3,13 +3,15 @@
 use std::{str::FromStr, sync::Arc};
 
 use bytes::{Buf, BufMut, BytesMut};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use url::Url;
 
 use super::{Frame, VarInt, qpack};
-use crate::io::read_incremental;
-
 use thiserror::Error;
+
+const MAX_CONNECT_FRAME_SIZE: usize = 64 * 1024;
+const WEBTRANSPORT_PROTOCOL: &str = "webtransport-h3";
+const LEGACY_WEBTRANSPORT_PROTOCOL: &str = "webtransport";
 
 // Errors that can occur while processing a CONNECT request.
 #[derive(Error, Debug, Clone)]
@@ -35,9 +37,21 @@ pub enum ConnectError {
     /// URL reconstruction from pseudo-headers failed.
     InvalidUrl(#[from] url::ParseError),
 
+    #[error("invalid authority")]
+    /// Reconstructed URL authority contained unsupported user information.
+    InvalidAuthority,
+
+    #[error("URL fragments are not valid in an HTTP request target")]
+    /// The request target contained a URI fragment.
+    InvalidFragment,
+
     #[error("invalid status")]
     /// `:status` could not be parsed as a valid HTTP status code.
     InvalidStatus,
+
+    #[error("CONNECT frame exceeds the 64 KiB implementation limit")]
+    /// CONNECT frame exceeded the implementation's bounded decode limit.
+    MessageTooLong,
 
     #[error("expected 200, got: {0:?}")]
     /// Response status was not successful.
@@ -119,24 +133,28 @@ impl ConnectRequest {
         };
 
         let protocol = headers.get(":protocol");
-        if protocol != Some("webtransport") {
+        if !matches!(
+            protocol,
+            Some(WEBTRANSPORT_PROTOCOL | LEGACY_WEBTRANSPORT_PROTOCOL)
+        ) {
             return Err(ConnectError::WrongProtocol(protocol.map(|s| s.to_string())));
         }
 
         let url = Url::parse(&format!("{scheme}://{authority}{path_and_query}"))?;
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(ConnectError::InvalidAuthority);
+        }
+        if url.fragment().is_some() {
+            return Err(ConnectError::InvalidFragment);
+        }
 
         Ok(Self { url })
     }
 
     /// Read and decode a CONNECT request from an async stream.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
-        read_incremental(
-            stream,
-            |cursor| Self::decode(cursor),
-            |err| matches!(err, ConnectError::UnexpectedEnd),
-            ConnectError::UnexpectedEnd,
-        )
-        .await
+        let frame = read_frame(stream).await?;
+        Self::decode(&mut frame.as_slice())
     }
 
     /// Encode this CONNECT request into a HEADERS frame.
@@ -150,7 +168,7 @@ impl ConnectRequest {
             None => self.url.path().to_string(),
         };
         headers.set(":path", &path_and_query);
-        headers.set(":protocol", "webtransport");
+        headers.set(":protocol", WEBTRANSPORT_PROTOCOL);
         encode_headers_frame(buf, &headers);
     }
 
@@ -196,13 +214,8 @@ impl ConnectResponse {
 
     /// Read and decode a CONNECT response from an async stream.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, ConnectError> {
-        read_incremental(
-            stream,
-            |cursor| Self::decode(cursor),
-            |err| matches!(err, ConnectError::UnexpectedEnd),
-            ConnectError::UnexpectedEnd,
-        )
-        .await
+        let frame = read_frame(stream).await?;
+        Self::decode(&mut frame.as_slice())
     }
 
     /// Encode this CONNECT response into a HEADERS frame.
@@ -230,4 +243,67 @@ fn encode_headers_frame<B: BufMut>(buf: &mut B, headers: &qpack::Headers) {
     Frame::HEADERS.encode(buf);
     VarInt::from_u32(payload.len() as u32).encode(buf);
     buf.put_slice(&payload);
+}
+
+async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Vec<u8>, ConnectError> {
+    loop {
+        let typ = VarInt::read(stream)
+            .await
+            .map_err(|_| ConnectError::UnexpectedEnd)?;
+        let length = VarInt::read(stream)
+            .await
+            .map_err(|_| ConnectError::UnexpectedEnd)?;
+        let length =
+            usize::try_from(length.into_inner()).map_err(|_| ConnectError::MessageTooLong)?;
+        if length > MAX_CONNECT_FRAME_SIZE {
+            return Err(ConnectError::MessageTooLong);
+        }
+
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload).await?;
+        let typ = Frame(typ);
+        if typ.is_grease() {
+            continue;
+        }
+
+        let mut frame = Vec::with_capacity(typ.0.size() + VarInt::MAX_SIZE + length);
+        typ.encode(&mut frame);
+        VarInt::try_from(length)
+            .map_err(|_| ConnectError::MessageTooLong)?
+            .encode(&mut frame);
+        frame.extend_from_slice(&payload);
+        return Ok(frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_uses_current_upgrade_token() {
+        let request = ConnectRequest {
+            url: Url::parse("https://example.com/chat").unwrap(),
+        };
+        let mut encoded = Vec::new();
+        request.encode(&mut encoded);
+
+        let mut source = encoded.as_slice();
+        let (typ, mut payload) = Frame::read(&mut source).unwrap();
+        assert_eq!(typ, Frame::HEADERS);
+        let headers = qpack::Headers::decode(&mut payload).unwrap();
+        assert_eq!(headers.get(":protocol"), Some("webtransport-h3"));
+    }
+
+    #[test]
+    fn request_roundtrips() {
+        let request = ConnectRequest {
+            url: Url::parse("https://example.com:4433/chat?room=alpha").unwrap(),
+        };
+        let mut encoded = Vec::new();
+        request.encode(&mut encoded);
+
+        let decoded = ConnectRequest::decode(&mut encoded.as_slice()).unwrap();
+        assert_eq!(decoded.url, request.url);
+    }
 }

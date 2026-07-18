@@ -6,7 +6,6 @@ mod error;
 mod frame;
 mod grease;
 mod huffman;
-mod io;
 mod qpack;
 mod settings;
 mod stream;

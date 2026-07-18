@@ -28,12 +28,6 @@ pub enum DecodeError {
     Utf8Error(#[from] std::str::Utf8Error),
 }
 
-#[cfg(target_pointer_width = "64")]
-const MAX_POWER: usize = 10 * 7;
-
-#[cfg(target_pointer_width = "32")]
-const MAX_POWER: usize = 5 * 7;
-
 // Simple QPACK implementation that only supports the static table and literals.
 #[derive(Debug, Default)]
 pub struct Headers {
@@ -266,16 +260,21 @@ pub fn decode_prefix<B: Buf>(buf: &mut B, size: u8) -> Result<(u8, usize), Decod
         }
 
         let byte = buf.get_u8() as usize;
-        value += (byte & 127) << power;
-        power += 7;
+        if power >= usize::BITS as usize {
+            return Err(DecodeError::BoundsExceeded);
+        }
+        let increment = (byte & 127)
+            .checked_shl(power as u32)
+            .ok_or(DecodeError::BoundsExceeded)?;
+        value = value
+            .checked_add(increment)
+            .ok_or(DecodeError::BoundsExceeded)?;
 
         if byte & 128 == 0 {
             break;
         }
 
-        if power >= MAX_POWER {
-            return Err(DecodeError::BoundsExceeded);
-        }
+        power = power.checked_add(7).ok_or(DecodeError::BoundsExceeded)?;
     }
 
     Ok((flags, value))
@@ -483,3 +482,17 @@ const PREDEFINED_HEADERS: [(&str, &str); 99] = [
     ("x-frame-options", "deny"),
     ("x-frame-options", "sameorigin"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_prefix_returns_error_without_panicking() {
+        let mut input = [0xff; 16].as_slice();
+        assert!(matches!(
+            decode_prefix(&mut input, 7),
+            Err(DecodeError::BoundsExceeded)
+        ));
+    }
+}
