@@ -51,17 +51,19 @@ coverage. The draft requires the RESET_STREAM_AT QUIC extension, which Quinn
   anyhow, and rand lockfile entries identified by `cargo audit`.
 - [x] Remove the unmaintained `rustls-pemfile` dependency in favor of
   `rustls-pki-types` PEM support.
-- [ ] Replace the minimal QPACK implementation or complete its HTTP/3 field
-  validation. It currently has no dynamic table support and does not enforce
-  every pseudo-header ordering and field-name rule from RFC 9114.
+- [x] Replace the minimal QPACK implementation or complete its HTTP/3 field
+  validation. The decoder remains intentionally static-table-only and rejects
+  dynamic references while enforcing RFC 9114 field and pseudo-header rules.
 - [ ] Add fuzz targets for VarInt, QPACK/Huffman, frame, SETTINGS, CONNECT, and
   capsule decoders. Seed the corpus with truncated, oversized, duplicate, and
   non-canonical inputs.
-- [ ] Add configurable handshake, idle, and DNS timeouts. Current async APIs
+- [x] Add configurable handshake, idle, and DNS timeouts. Current async APIs
   rely on callers to wrap operations in a timeout.
 - [ ] Add explicit server resource-limit configuration and tests for concurrent
   streams, receive windows, datagram buffers, pending handshakes, and connection
   admission.
+  - [x] Expose Quinn transport limits and pending-handshake admission settings.
+  - [ ] Add end-to-end saturation tests for each configured limit.
 - [ ] Redesign the transport-agnostic datagram send API to be asynchronous.
   The browser implementation currently has to queue a local task and cannot
   report a later JavaScript write failure through the synchronous trait method.
@@ -72,10 +74,10 @@ coverage. The draft requires the RESET_STREAM_AT QUIC extension, which Quinn
 
 ## P2 - Operational and maintenance work
 
-- [ ] Add `SECURITY.md` with supported versions, private vulnerability
+- [x] Add `SECURITY.md` with supported versions, private vulnerability
   reporting instructions, and response expectations.
-- [ ] Add a changelog and a documented semver/MSRV policy.
-- [ ] Expand the README with native client/server examples, certificate
+- [x] Add a changelog and a documented semver/MSRV policy.
+- [x] Expand the README with native client/server examples, certificate
   verification guidance, timeout examples, limits, browser requirements, and
   protocol-draft compatibility.
 - [x] Add a weekly and per-change `cargo audit` CI job.
