@@ -110,6 +110,13 @@ impl ConnectRequest {
         // The frame payload should be complete, so an additional UnexpectedEnd is unexpected here.
 
         let headers = qpack::Headers::decode(&mut data)?;
+        headers.validate_pseudo_headers(&[
+            ":method",
+            ":scheme",
+            ":authority",
+            ":path",
+            ":protocol",
+        ])?;
 
         let scheme = match headers.get(":scheme") {
             Some("https") => "https",
@@ -197,6 +204,7 @@ impl ConnectResponse {
         }
 
         let headers = qpack::Headers::decode(&mut data)?;
+        headers.validate_pseudo_headers(&[":status"])?;
 
         let status = match headers
             .get(":status")
