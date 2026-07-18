@@ -48,6 +48,15 @@ jobs:
         run: cargo check --target wasm32-unknown-unknown -p webtrans -p webtrans-wasm -p webtrans-wasm-demo
       - name: Lint WASM crates
         run: cargo clippy --target wasm32-unknown-unknown -p webtrans -p webtrans-wasm -p webtrans-wasm-demo
+      - name: Read wasm-bindgen version
+        run: |
+          echo "WASM_BINDGEN_VERSION=$(cargo metadata --format-version 1 --locked | jq -r '.packages[] | select(.name == "wasm-bindgen") | .version')" >> "$GITHUB_ENV"
+      - name: Install matching WASM test runner
+        run: cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
+      - name: Test browser stream coordination
+        env:
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER: wasm-bindgen-test-runner
+        run: cargo test --target wasm32-unknown-unknown -p webtrans-wasm
 
   security:
     runs-on: ubuntu-latest

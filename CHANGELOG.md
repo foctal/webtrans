@@ -13,6 +13,8 @@ README.
   native servers.
 - Builder access to Quinn transport configuration for idle timeouts, stream
   limits, flow-control windows, and datagram buffers.
+- Browser tests for cancellation and clone coordination of incoming stream
+  readers.
 - Security reporting and support policy.
 
 ### Changed
@@ -22,3 +24,10 @@ README.
   request/response pseudo-header rules.
 - Non-zero QPACK dynamic-table prefixes are rejected explicitly because the
   decoder intentionally supports only static-table and literal fields.
+- The transport-agnostic datagram send API is asynchronous so browser write
+  failures are returned to callers.
+- Browser session clones share and serialize incoming stream and datagram
+  readers. Cancelling an accept future preserves its pending browser read for
+  the next caller.
+- Browser `Session::new` now returns a `Result` because acquiring the required
+  Web Streams locks can fail.

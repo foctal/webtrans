@@ -64,11 +64,12 @@ coverage. The draft requires the RESET_STREAM_AT QUIC extension, which Quinn
   admission.
   - [x] Expose Quinn transport limits and pending-handshake admission settings.
   - [ ] Add end-to-end saturation tests for each configured limit.
-- [ ] Redesign the transport-agnostic datagram send API to be asynchronous.
-  The browser implementation currently has to queue a local task and cannot
-  report a later JavaScript write failure through the synchronous trait method.
-- [ ] Define and test cancellation and clone semantics for browser stream
-  acceptors. Multiple concurrent accept calls contend for Web Streams readers.
+- [x] Redesign the transport-agnostic datagram send API to be asynchronous.
+  The browser implementation now awaits the JavaScript write and reports its
+  failure through the shared trait method.
+- [x] Define and test cancellation and clone semantics for browser stream
+  acceptors. Clones serialize access to shared Web Streams readers, and a
+  cancelled accept preserves its pending read for the next caller.
 - [ ] Decide whether dropping an unanswered `Request` should send an explicit
   rejection, and make that behavior observable and documented.
 
@@ -91,7 +92,8 @@ coverage. The draft requires the RESET_STREAM_AT QUIC extension, which Quinn
 - [ ] Review public API names and breaking changes before the next release.
   This review intentionally changes `Server::accept`, removes the panic-prone
   native `Client::default`, makes WASM `set_priority` return a `Result`, and
-  adds a structured WASM session-close error.
+  adds a structured WASM session-close error, asynchronous generic datagram
+  sends, and fallible WASM `Session::new`.
 
 ## Verification checklist
 

@@ -63,7 +63,10 @@ pub trait Session: Clone + MaybeSend + MaybeSync + 'static {
     /// - Peer is not receiving datagrams.
     /// - Peer has too many outstanding datagrams.
     /// - Implementation-specific limits.
-    fn send_datagram(&self, payload: Bytes) -> Result<(), Self::Error>;
+    fn send_datagram(
+        &self,
+        payload: Bytes,
+    ) -> impl Future<Output = Result<(), Self::Error>> + MaybeSend;
 
     /// Receive a datagram over the network.
     fn recv_datagram(&self) -> impl Future<Output = Result<Bytes, Self::Error>> + MaybeSend;

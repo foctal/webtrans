@@ -598,7 +598,7 @@ impl webtrans_trait::Session for Session {
         Self::closed(self).await
     }
 
-    fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
+    async fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
         Self::send_datagram(self, data)
     }
 
