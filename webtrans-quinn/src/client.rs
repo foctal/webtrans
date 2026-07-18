@@ -80,7 +80,7 @@ impl ClientBuilder {
         }
 
         let crypto = self
-            .builder()
+            .builder()?
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -113,7 +113,7 @@ impl ClientBuilder {
 
         // Configure the crypto client.
         let crypto = self
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(fingerprints.clone())
             .with_no_client_auth();
@@ -130,16 +130,20 @@ impl ClientBuilder {
         DangerousClientBuilder { inner: self }
     }
 
-    fn builder(&self) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    fn builder(
+        &self,
+    ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ClientError>
+    {
         rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
+            .map_err(Into::into)
     }
 
     fn build(self, mut crypto: rustls::ClientConfig) -> Result<Client, ClientError> {
         crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
 
-        let client_config = QuicClientConfig::try_from(crypto).unwrap();
+        let client_config = QuicClientConfig::try_from(crypto)
+            .map_err(|_| ClientError::InvalidCryptoConfiguration)?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
 
         let mut transport = quinn::TransportConfig::default();
@@ -149,7 +153,8 @@ impl ClientBuilder {
 
         client_config.transport_config(transport.into());
 
-        let client = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
+        let client = quinn::Endpoint::client(SocketAddr::from(([0_u16; 8], 0)))
+            .map_err(|error| ClientError::Io(Arc::new(error)))?;
         Ok(Client {
             endpoint: client,
             config: client_config,
@@ -188,7 +193,7 @@ impl DangerousClientBuilder {
 
         let crypto = self
             .inner
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(noop))
             .with_no_client_auth();
@@ -214,13 +219,8 @@ impl Client {
 
     /// Connect to the server.
     pub async fn connect(&self, url: Url) -> Result<Session, ClientError> {
+        validate_url(&url)?;
         let port = url.port().unwrap_or(443);
-
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(ClientError::InvalidUrl(
-                "userinfo is not supported in the authority".to_string(),
-            ));
-        }
 
         let (host, remote) = match url
             .host()
@@ -257,11 +257,28 @@ impl Client {
     }
 }
 
-#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
-impl Default for Client {
-    fn default() -> Self {
-        ClientBuilder::new().with_system_roots().unwrap()
+fn validate_url(url: &Url) -> Result<(), ClientError> {
+    if url.scheme() != "https" {
+        return Err(ClientError::InvalidUrl(
+            "WebTransport requires an https URL".to_string(),
+        ));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ClientError::InvalidUrl(
+            "userinfo is not supported in the authority".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(ClientError::InvalidUrl(
+            "URL fragments are not sent in HTTP request targets".to_string(),
+        ));
+    }
+    if url.cannot_be_a_base() || url.host().is_none() {
+        return Err(ClientError::InvalidUrl(
+            "URL must contain a valid authority and path".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg_attr(not(any(feature = "ring", feature = "aws-lc-rs")), allow(dead_code))]
@@ -377,5 +394,18 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_webtransport_urls() {
+        assert!(validate_url(&Url::parse("https://example.com/chat").unwrap()).is_ok());
+        assert!(validate_url(&Url::parse("http://example.com/chat").unwrap()).is_err());
+        assert!(validate_url(&Url::parse("https://user@example.com/chat").unwrap()).is_err());
+        assert!(validate_url(&Url::parse("https://example.com/chat#fragment").unwrap()).is_err());
     }
 }

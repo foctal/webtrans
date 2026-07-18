@@ -43,6 +43,14 @@ pub enum ClientError {
     #[error("invalid url: {0}")]
     InvalidUrl(String),
 
+    /// Local UDP endpoint creation failed.
+    #[error("io error: {0}")]
+    Io(Arc<std::io::Error>),
+
+    /// TLS configuration did not provide a QUIC-compatible initial cipher suite.
+    #[error("TLS configuration has no QUIC-compatible initial cipher suite")]
+    InvalidCryptoConfiguration,
+
     #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
     /// Rustls-level TLS configuration or handshake error.
     #[error("rustls error: {0}")]
@@ -263,6 +271,10 @@ pub enum ServerError {
     /// Generic I/O failure during server setup or handshake.
     #[error("io error: {0}")]
     IoError(Arc<std::io::Error>),
+
+    /// TLS configuration did not provide a QUIC-compatible initial cipher suite.
+    #[error("TLS configuration has no QUIC-compatible initial cipher suite")]
+    InvalidCryptoConfiguration,
 
     #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
     /// Rustls-level TLS configuration or handshake error.

@@ -170,7 +170,7 @@ impl Session {
     /// This only works with a fresh QUIC connection negotiated with the HTTP/3 ALPN.
     pub async fn connect(conn: quinn::Connection, url: Url) -> Result<Session, ClientError> {
         // Perform the HTTP/3 handshake by sending/receiving SETTINGS frames.
-        let settings = Settings::connect(&conn).await?;
+        let settings = Settings::connect(&conn, true).await?;
 
         // Send the HTTP/3 CONNECT request.
         let connect = Connect::open(&conn, url).await?;
@@ -185,7 +185,13 @@ impl Session {
     /// Accept a new unidirectional stream. See [`quinn::Connection::accept_uni`].
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx)).await
+            poll_fn(|cx| {
+                accept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poll_accept_uni(cx)
+            })
+            .await
         } else {
             self.conn
                 .accept_uni()
@@ -198,7 +204,13 @@ impl Session {
     /// Accept a new bidirectional stream. See [`quinn::Connection::accept_bi`].
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx)).await
+            poll_fn(|cx| {
+                accept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poll_accept_bi(cx)
+            })
+            .await
         } else {
             self.conn
                 .accept_bi()
@@ -290,10 +302,7 @@ impl Session {
     /// Compute the maximum size of datagrams that may be passed to
     /// [`send_datagram`](Self::send_datagram).
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
-            .max_datagram_size()
-            .expect("datagram support is required");
+        let mtu = self.conn.max_datagram_size().unwrap_or(0);
         mtu.saturating_sub(self.header_datagram.len())
     }
 

@@ -36,7 +36,7 @@ impl ServerBuilder {
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
-            addr: "[::]:443".parse().unwrap(),
+            addr: std::net::SocketAddr::from(([0_u16; 8], 443)),
             congestion_controller: None,
         }
     }
@@ -74,8 +74,11 @@ impl ServerBuilder {
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // Required ALPN.
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        let config: quinn::crypto::rustls::QuicServerConfig = config
+            .try_into()
+            .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        config.transport_config(self.transport_config());
 
         let server = quinn::Endpoint::server(config, self.addr)
             .map_err(|e| ServerError::IoError(e.into()))?;
@@ -102,13 +105,24 @@ impl ServerBuilder {
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()];
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        let config: quinn::crypto::rustls::QuicServerConfig = config
+            .try_into()
+            .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        config.transport_config(self.transport_config());
 
         let server = quinn::Endpoint::server(config, self.addr)
             .map_err(|e| ServerError::IoError(e.into()))?;
 
         Ok(Server::new(server))
+    }
+
+    fn transport_config(&self) -> Arc<quinn::TransportConfig> {
+        let mut transport = quinn::TransportConfig::default();
+        if let Some(controller) = &self.congestion_controller {
+            transport.congestion_controller_factory(controller.clone());
+        }
+        Arc::new(transport)
     }
 }
 
@@ -130,7 +144,10 @@ impl Server {
     }
 
     /// Accept a new WebTransport session request from a client.
-    pub async fn accept(&mut self) -> Option<Request> {
+    ///
+    /// Returns `None` after the endpoint is closed. Handshake failures are
+    /// returned to the caller instead of being silently discarded.
+    pub async fn accept(&mut self) -> Option<Result<Request, ServerError>> {
         loop {
             tokio::select! {
                 res = self.endpoint.accept() => {
@@ -141,9 +158,7 @@ impl Server {
                     }));
                 }
                 Some(res) = self.accept.next() => {
-                    if let Ok(session) = res {
-                        return Some(session)
-                    }
+                    return Some(res);
                 }
             }
         }
@@ -161,7 +176,7 @@ impl Request {
     /// Accept a new WebTransport session from a client.
     pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
         // Perform the HTTP/3 handshake by sending/receiving SETTINGS frames.
-        let settings = Settings::connect(&conn).await?;
+        let settings = Settings::connect(&conn, false).await?;
 
         // Accept the CONNECT request but defer the response.
         let connect = Connect::accept(&conn).await?;

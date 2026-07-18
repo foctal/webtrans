@@ -1,7 +1,7 @@
 use anyhow::Context;
 use clap::Parser;
-use rustls::pki_types::CertificateDer;
-use std::{fs, io, path};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+use std::{fs, path};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use url::Url;
@@ -88,9 +88,8 @@ async fn main() -> anyhow::Result<()> {
 }
 
 fn load_pem_certs(path: &path::Path) -> anyhow::Result<Vec<CertificateDer<'static>>> {
-    let file = fs::File::open(path).context("failed to open cert file")?;
-    let mut reader = io::BufReader::new(file);
-    let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let pem = fs::read(path).context("failed to read cert file")?;
+    let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&pem)
         .collect::<Result<_, _>>()
         .context("failed to load certs")?;
     Ok(chain)
