@@ -5,18 +5,57 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+  schedule:
+    - cron: "23 3 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
 
 jobs:
-  build:
-
+  native:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Check default features
+        run: cargo check --workspace --all-targets
+      - name: Lint default features
+        run: cargo clippy --workspace --all-targets
+      - name: Test default features
+        run: cargo test --workspace --all-targets
+      - name: Check aws-lc-rs backend
+        run: cargo check -p webtrans-quinn --no-default-features --features aws-lc-rs
+      - name: Build documentation
+        run: cargo doc --workspace --no-deps
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Check WASM crates
+        run: cargo check --target wasm32-unknown-unknown -p webtrans -p webtrans-wasm -p webtrans-wasm-demo
+      - name: Lint WASM crates
+        run: cargo clippy --target wasm32-unknown-unknown -p webtrans -p webtrans-wasm -p webtrans-wasm-demo
+
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
