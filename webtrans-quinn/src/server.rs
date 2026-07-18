@@ -2,6 +2,7 @@
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 use std::sync::Arc;
+use std::{num::NonZeroUsize, time::Duration};
 
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
@@ -19,8 +20,9 @@ use crate::{Connect, ServerError, Session, Settings};
 pub struct ServerBuilder {
     provider: crypto::Provider,
     addr: std::net::SocketAddr,
-    congestion_controller:
-        Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>>,
+    transport: quinn::TransportConfig,
+    handshake_timeout: Option<Duration>,
+    max_pending_handshakes: NonZeroUsize,
 }
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
@@ -37,7 +39,9 @@ impl ServerBuilder {
         Self {
             provider: crypto::default_provider(),
             addr: std::net::SocketAddr::from(([0_u16; 8], 443)),
-            congestion_controller: None,
+            transport: quinn::TransportConfig::default(),
+            handshake_timeout: None,
+            max_pending_handshakes: NonZeroUsize::MAX,
         }
     }
 
@@ -48,16 +52,39 @@ impl ServerBuilder {
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(quinn::congestion::NewRenoConfig::default()))
-            }
-            CongestionControl::Throughput => {
-                Some(Arc::new(quinn::congestion::BbrConfig::default()))
-            }
-            CongestionControl::Default => None,
+        match algorithm {
+            CongestionControl::LowLatency => self.transport.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            ),
+            CongestionControl::Throughput => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+            CongestionControl::Default => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
         };
 
+        self
+    }
+
+    /// Replace the QUIC transport configuration.
+    ///
+    /// Use this to bound receive windows, concurrent streams, datagram buffers,
+    /// idle time, and other per-connection resources.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Limit the combined QUIC, HTTP/3 SETTINGS, and CONNECT handshake duration.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Limit the number of handshakes retained before accepting another connection.
+    pub fn with_max_pending_handshakes(mut self, limit: NonZeroUsize) -> Self {
+        self.max_pending_handshakes = limit;
         self
     }
 
@@ -78,12 +105,16 @@ impl ServerBuilder {
             .try_into()
             .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-        config.transport_config(self.transport_config());
+        config.transport_config(Arc::new(self.transport));
 
         let server = quinn::Endpoint::server(config, self.addr)
             .map_err(|e| ServerError::IoError(e.into()))?;
 
-        Ok(Server::new(server))
+        Ok(Server::with_accept_limits(
+            server,
+            self.handshake_timeout,
+            self.max_pending_handshakes,
+        ))
     }
 
     /// Supply certificates for multiple hostnames using SNI.
@@ -109,20 +140,16 @@ impl ServerBuilder {
             .try_into()
             .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
         let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-        config.transport_config(self.transport_config());
+        config.transport_config(Arc::new(self.transport));
 
         let server = quinn::Endpoint::server(config, self.addr)
             .map_err(|e| ServerError::IoError(e.into()))?;
 
-        Ok(Server::new(server))
-    }
-
-    fn transport_config(&self) -> Arc<quinn::TransportConfig> {
-        let mut transport = quinn::TransportConfig::default();
-        if let Some(controller) = &self.congestion_controller {
-            transport.congestion_controller_factory(controller.clone());
-        }
-        Arc::new(transport)
+        Ok(Server::with_accept_limits(
+            server,
+            self.handshake_timeout,
+            self.max_pending_handshakes,
+        ))
     }
 }
 
@@ -130,6 +157,8 @@ impl ServerBuilder {
 pub struct Server {
     endpoint: quinn::Endpoint,
     accept: FuturesUnordered<BoxFuture<'static, Result<Request, ServerError>>>,
+    handshake_timeout: Option<Duration>,
+    max_pending_handshakes: NonZeroUsize,
 }
 
 impl Server {
@@ -140,6 +169,21 @@ impl Server {
         Self {
             endpoint,
             accept: Default::default(),
+            handshake_timeout: None,
+            max_pending_handshakes: NonZeroUsize::MAX,
+        }
+    }
+
+    fn with_accept_limits(
+        endpoint: quinn::Endpoint,
+        handshake_timeout: Option<Duration>,
+        max_pending_handshakes: NonZeroUsize,
+    ) -> Self {
+        Self {
+            endpoint,
+            accept: Default::default(),
+            handshake_timeout,
+            max_pending_handshakes,
         }
     }
 
@@ -150,11 +194,20 @@ impl Server {
     pub async fn accept(&mut self) -> Option<Result<Request, ServerError>> {
         loop {
             tokio::select! {
-                res = self.endpoint.accept() => {
+                res = self.endpoint.accept(), if self.accept.len() < self.max_pending_handshakes.get() => {
                     let conn = res?;
+                    let timeout = self.handshake_timeout;
                     self.accept.push(Box::pin(async move {
-                        let conn = conn.await?;
-                        Request::accept(conn).await
+                        let handshake = async move {
+                            let conn = conn.await?;
+                            Request::accept(conn).await
+                        };
+                        match timeout {
+                            Some(timeout) => tokio::time::timeout(timeout, handshake)
+                                .await
+                                .map_err(|_| ServerError::HandshakeTimeout)?,
+                            None => handshake.await,
+                        }
                     }));
                 }
                 Some(res) = self.accept.next() => {
@@ -204,5 +257,20 @@ impl Request {
     pub async fn close(mut self, status: http::StatusCode) -> Result<(), ServerError> {
         self.connect.respond(status).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_records_handshake_admission_limits() {
+        let limit = NonZeroUsize::new(17).unwrap();
+        let builder = ServerBuilder::new()
+            .with_handshake_timeout(Duration::from_secs(9))
+            .with_max_pending_handshakes(limit);
+        assert_eq!(builder.handshake_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(builder.max_pending_handshakes, limit);
     }
 }

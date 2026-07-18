@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 use quinn::crypto::rustls::QuicClientConfig;
@@ -32,8 +33,9 @@ pub enum CongestionControl {
 /// This is optional; advanced users may use [Client::new] directly.
 pub struct ClientBuilder {
     provider: crypto::Provider,
-    congestion_controller:
-        Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>>,
+    transport: quinn::TransportConfig,
+    dns_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
 }
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
@@ -42,22 +44,47 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
-            congestion_controller: None,
+            transport: quinn::TransportConfig::default(),
+            dns_timeout: None,
+            handshake_timeout: None,
         }
     }
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(quinn::congestion::NewRenoConfig::default()))
-            }
-            CongestionControl::Throughput => {
-                Some(Arc::new(quinn::congestion::BbrConfig::default()))
-            }
-            CongestionControl::Default => None,
+        match algorithm {
+            CongestionControl::LowLatency => self.transport.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            ),
+            CongestionControl::Throughput => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+            CongestionControl::Default => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
         };
 
+        self
+    }
+
+    /// Replace the QUIC transport configuration.
+    ///
+    /// Use this to configure idle timeouts, receive windows, concurrent stream
+    /// limits, datagram buffers, and other transport resource limits.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Limit how long DNS resolution may take.
+    pub fn with_dns_timeout(mut self, timeout: Duration) -> Self {
+        self.dns_timeout = Some(timeout);
+        self
+    }
+
+    /// Limit the combined QUIC, HTTP/3 SETTINGS, and CONNECT handshake duration.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
         self
     }
 
@@ -146,18 +173,15 @@ impl ClientBuilder {
             .map_err(|_| ClientError::InvalidCryptoConfiguration)?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
 
-        let mut transport = quinn::TransportConfig::default();
-        if let Some(cc) = &self.congestion_controller {
-            transport.congestion_controller_factory(cc.clone());
-        }
-
-        client_config.transport_config(transport.into());
+        client_config.transport_config(Arc::new(self.transport));
 
         let client = quinn::Endpoint::client(SocketAddr::from(([0_u16; 8], 0)))
             .map_err(|error| ClientError::Io(Arc::new(error)))?;
         Ok(Client {
             endpoint: client,
             config: client_config,
+            dns_timeout: self.dns_timeout,
+            handshake_timeout: self.handshake_timeout,
         })
     }
 }
@@ -207,6 +231,8 @@ impl DangerousClientBuilder {
 pub struct Client {
     endpoint: quinn::Endpoint,
     config: quinn::ClientConfig,
+    dns_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
 }
 
 impl Client {
@@ -214,7 +240,12 @@ impl Client {
     ///
     /// The ALPN must be set to [ALPN].
     pub fn new(endpoint: quinn::Endpoint, config: quinn::ClientConfig) -> Self {
-        Self { endpoint, config }
+        Self {
+            endpoint,
+            config,
+            dns_timeout: None,
+            handshake_timeout: None,
+        }
     }
 
     /// Connect to the server.
@@ -229,7 +260,14 @@ impl Client {
             Host::Domain(domain) => {
                 let domain = domain.to_string();
                 // Look up the DNS entry.
-                let mut remotes = match lookup_host((domain.clone(), port)).await {
+                let lookup = lookup_host((domain.clone(), port));
+                let result = match self.dns_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, lookup)
+                        .await
+                        .map_err(|_| ClientError::DnsTimeout)?,
+                    None => lookup.await,
+                };
+                let mut remotes = match result {
                     Ok(remotes) => remotes,
                     Err(_) => return Err(ClientError::InvalidDnsName(domain)),
                 };
@@ -247,13 +285,20 @@ impl Client {
         };
 
         // Connect to the server using the resolved address.
-        let conn = self
+        let connecting = self
             .endpoint
             .connect_with(self.config.clone(), remote, &host)?;
-        let conn = conn.await?;
+        let establish = async move {
+            let conn = connecting.await?;
+            Session::connect(conn, url).await
+        };
 
-        // Complete WebTransport connection establishment.
-        Session::connect(conn, url).await
+        match self.handshake_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, establish)
+                .await
+                .map_err(|_| ClientError::HandshakeTimeout)?,
+            None => establish.await,
+        }
     }
 }
 
@@ -407,5 +452,14 @@ mod tests {
         assert!(validate_url(&Url::parse("http://example.com/chat").unwrap()).is_err());
         assert!(validate_url(&Url::parse("https://user@example.com/chat").unwrap()).is_err());
         assert!(validate_url(&Url::parse("https://example.com/chat#fragment").unwrap()).is_err());
+    }
+
+    #[test]
+    fn builder_records_operation_timeouts() {
+        let builder = ClientBuilder::new()
+            .with_dns_timeout(Duration::from_secs(2))
+            .with_handshake_timeout(Duration::from_secs(7));
+        assert_eq!(builder.dns_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(builder.handshake_timeout, Some(Duration::from_secs(7)));
     }
 }

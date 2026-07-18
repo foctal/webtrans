@@ -43,6 +43,14 @@ pub enum ClientError {
     #[error("invalid url: {0}")]
     InvalidUrl(String),
 
+    /// DNS resolution exceeded the configured timeout.
+    #[error("DNS resolution timed out")]
+    DnsTimeout,
+
+    /// QUIC and HTTP/3 session establishment exceeded the configured timeout.
+    #[error("connection handshake timed out")]
+    HandshakeTimeout,
+
     /// Local UDP endpoint creation failed.
     #[error("io error: {0}")]
     Io(Arc<std::io::Error>),
@@ -251,6 +259,10 @@ pub enum ServerError {
     /// QUIC connection-level failure.
     #[error("connection error")]
     Connection(#[from] quinn::ConnectionError),
+
+    /// QUIC and HTTP/3 session establishment exceeded the configured timeout.
+    #[error("connection handshake timed out")]
+    HandshakeTimeout,
 
     /// Failed to write handshake data.
     #[error("failed to write")]
