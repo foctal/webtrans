@@ -15,7 +15,9 @@ The native transport implements the WebTransport over HTTP/3 negotiation and
 wire formats used by `draft-ietf-webtrans-http3-16`, with legacy upgrade-token
 acceptance for older peers. Quinn does not yet expose the draft-16
 RESET_STREAM_AT extension, so native support is draft-compatible rather than
-fully draft-16 compliant.
+fully draft-16 compliant. Native applications can inspect
+`webtrans_quinn::RESET_STREAM_AT_SUPPORTED`; it remains `false` until Quinn
+provides the required transport extension.
 
 The WASM transport requires a browser that provides the global `WebTransport`
 API in a secure context. Browser certificate and network policy still apply.
@@ -116,6 +118,12 @@ while let Some(result) = server.accept().await {
 # }
 ```
 
+Every accepted `Request` must be completed with `Request::ok` or
+`Request::close`. Dropping an unanswered request automatically sends
+`500 Internal Server Error` and emits a tracing event. If the request is
+dropped after leaving its Tokio runtime, the response cannot be scheduled and
+an error event is emitted instead.
+
 Choose limits from a memory budget and expected bandwidth-delay product. In
 particular, worst-case receive memory grows with the number of connections,
 concurrent streams, receive windows, and buffered datagrams. Applications
@@ -164,3 +172,23 @@ Criterion benchmarks are available for `webtrans-proto`:
 ```bash
 cargo bench -p webtrans-proto
 ```
+
+## Fuzzing and interoperability
+
+Decoder fuzz targets and their seeded corpora are in `fuzz/`:
+
+```bash
+cargo check --manifest-path fuzz/Cargo.toml --all-targets
+cd fuzz
+cargo fuzz run varint
+```
+
+The independent native interoperability suite uses `wtransport`:
+
+```bash
+cargo test --manifest-path interop/Cargo.toml
+```
+
+The dedicated interoperability workflow additionally installs the current
+Playwright Chromium build and covers bidirectional and unidirectional streams,
+datagrams, close codes and reasons, rejected requests, and reconnects.

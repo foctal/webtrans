@@ -15,6 +15,10 @@ README.
   limits, flow-control windows, and datagram buffers.
 - Browser tests for cancellation and clone coordination of incoming stream
   readers.
+- Seeded cargo-fuzz targets for all protocol decoder surfaces.
+- End-to-end server resource-limit saturation tests.
+- Automated interoperability coverage for current Chromium and the independent
+  `wtransport` implementation.
 - Security reporting and support policy.
 
 ### Changed
@@ -31,3 +35,10 @@ README.
   the next caller.
 - Browser `Session::new` now returns a `Result` because acquiring the required
   Web Streams locks can fail.
+- Native session closure now sends CLOSE_WEBTRANSPORT_SESSION in an HTTP/3 DATA
+  frame before transport teardown, preserving full close codes and reasons
+  across independent implementations.
+- Dropping an unanswered native server `Request` automatically returns
+  `500 Internal Server Error` and emits an observable tracing event.
+- Non-success CONNECT responses are decoded and surfaced to native clients
+  instead of being reported as truncated handshakes.
