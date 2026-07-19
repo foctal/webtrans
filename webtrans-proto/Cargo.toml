@@ -18,6 +18,9 @@ http = { workspace = true }
 url = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["io-util"] }
 
+[features]
+fuzzing = []
+
 [dev-dependencies]
 criterion = "0.8"
 
