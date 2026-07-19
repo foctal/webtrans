@@ -1,0 +1,11 @@
+{
+  "name": "webtrans-chromium-interop",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "playwright": "latest"
+  }
+}

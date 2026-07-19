@@ -1,0 +1,16 @@
+[package]
+name = "webtrans-interop"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+bytes = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+url = "2"
+webtrans-quinn = { path = "../webtrans-quinn" }
+wtransport = { version = "0.7.1", features = ["dangerous-configuration"] }
+
+[workspace]
+members = ["."]

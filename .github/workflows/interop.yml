@@ -1,0 +1,36 @@
+name: Interoperability
+
+on:
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+
+jobs:
+  independent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test independent native implementation
+        run: cargo test --manifest-path interop/Cargo.toml
+
+  chromium:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install current Playwright and Chromium
+        working-directory: interop/browser
+        run: |
+          npm install playwright@latest --no-save
+          npx playwright install --with-deps chromium
+      - name: Test current Chromium
+        working-directory: interop/browser
+        run: npm test
