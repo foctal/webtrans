@@ -24,11 +24,20 @@ pub use session::*;
 mod connect;
 mod settings;
 
-use connect::*;
-use settings::*;
+use connect::Connect;
+pub use connect::ConnectError;
+use settings::Settings;
+pub use settings::SettingsError;
 
 /// The HTTP/3 ALPN token used when negotiating a QUIC connection.
 pub const ALPN: &str = "h3";
+
+/// Whether the native transport can use the draft-required RESET_STREAM_AT
+/// extension.
+///
+/// Quinn 0.11 does not expose this extension, so callers that require strict
+/// draft-16 conformance should reject the native backend while this is `false`.
+pub const RESET_STREAM_AT_SUPPORTED: bool = false;
 
 // Export the simple crypto provider.
 pub mod crypto;

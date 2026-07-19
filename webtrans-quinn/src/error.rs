@@ -252,6 +252,10 @@ impl From<quinn::ClosedStream> for ClosedStream {
 /// Error returned when receiving a new WebTransport session.
 #[derive(Error, Debug, Clone)]
 pub enum ServerError {
+    /// A request no longer owns the handshake state needed to complete it.
+    #[error("WebTransport request was already completed")]
+    RequestAlreadyCompleted,
+
     /// Incoming bytes ended before the handshake exchange completed.
     #[error("unexpected end of stream")]
     UnexpectedEnd,

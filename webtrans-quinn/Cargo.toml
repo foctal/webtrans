@@ -19,7 +19,7 @@ http = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util", "macros", "time"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "sync", "time"] }
 quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "bloom"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
 rustls-native-certs = "0.8"
@@ -31,3 +31,6 @@ webtrans-trait = { workspace = true }
 default = ["ring"]
 ring = ["quinn/rustls-ring", "rustls/ring"]
 aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

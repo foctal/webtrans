@@ -64,6 +64,19 @@ impl Connect {
         Ok(())
     }
 
+    pub async fn reject(&mut self, status: http::StatusCode) -> Result<(), ConnectError> {
+        self.respond(status).await?;
+        self.send
+            .finish()
+            .map_err(|_| ConnectError::UnexpectedEnd)?;
+        // Once the response and FIN are queued, a peer may immediately close
+        // the rejected connection. Waiting here keeps the control streams alive
+        // long enough to avoid racing the response, but the resulting stop or
+        // connection-close status does not invalidate the rejection.
+        let _ = self.send.stopped().await;
+        Ok(())
+    }
+
     pub async fn open(conn: &quinn::Connection, url: Url) -> Result<Self, ConnectError> {
         // Create a stream for sending the CONNECT request.
         let (mut send, mut recv) = conn.open_bi().await?;

@@ -206,16 +206,12 @@ impl ConnectResponse {
         let headers = qpack::Headers::decode(&mut data)?;
         headers.validate_pseudo_headers(&[":status"])?;
 
-        let status = match headers
+        let status = headers
             .get(":status")
-            .map(|status| {
+            .ok_or(ConnectError::WrongStatus(None))
+            .and_then(|status| {
                 http::StatusCode::from_str(status).map_err(|_| ConnectError::InvalidStatus)
-            })
-            .transpose()?
-        {
-            Some(status) if status.is_success() => status,
-            o => return Err(ConnectError::WrongStatus(o)),
-        };
+            })?;
 
         Ok(Self { status })
     }
@@ -313,5 +309,17 @@ mod tests {
 
         let decoded = ConnectRequest::decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(decoded.url, request.url);
+    }
+
+    #[test]
+    fn response_preserves_rejection_status() {
+        let response = ConnectResponse {
+            status: http::StatusCode::FORBIDDEN,
+        };
+        let mut encoded = Vec::new();
+        response.encode(&mut encoded);
+
+        let decoded = ConnectResponse::decode(&mut encoded.as_slice()).unwrap();
+        assert_eq!(decoded.status, http::StatusCode::FORBIDDEN);
     }
 }

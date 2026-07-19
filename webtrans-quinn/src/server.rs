@@ -187,6 +187,11 @@ impl Server {
         }
     }
 
+    /// Return the local address on which the server endpoint is listening.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
+        self.endpoint.local_addr()
+    }
+
     /// Accept a new WebTransport session request from a client.
     ///
     /// Returns `None` after the endpoint is closed. Handshake failures are
@@ -220,9 +225,10 @@ impl Server {
 
 /// A mostly complete WebTransport handshake awaiting server accept/reject based on URL.
 pub struct Request {
-    conn: quinn::Connection,
-    settings: Settings,
-    connect: Connect,
+    conn: Option<quinn::Connection>,
+    settings: Option<Settings>,
+    connect: Option<Connect>,
+    url: Url,
 }
 
 impl Request {
@@ -235,28 +241,89 @@ impl Request {
         let connect = Connect::accept(&conn).await?;
 
         // Return the request while retaining settings/connect streams.
+        let url = connect.url().clone();
         Ok(Self {
-            conn,
-            settings,
-            connect,
+            conn: Some(conn),
+            settings: Some(settings),
+            connect: Some(connect),
+            url,
         })
     }
 
     /// Return the URL provided by the client.
     pub fn url(&self) -> &Url {
-        self.connect.url()
+        &self.url
     }
 
     /// Accept the session and return a 200 OK response.
     pub async fn ok(mut self) -> Result<Session, ServerError> {
-        self.connect.respond(http::StatusCode::OK).await?;
-        Ok(Session::new(self.conn, self.settings, self.connect))
+        let mut connect = self
+            .connect
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        connect.respond(http::StatusCode::OK).await?;
+        let conn = self
+            .conn
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        let settings = self
+            .settings
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        Ok(Session::new(conn, settings, connect))
     }
 
     /// Reject the session and return the provided HTTP status code.
     pub async fn close(mut self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.respond(status).await?;
+        let mut connect = self
+            .connect
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        connect.reject(status).await?;
         Ok(())
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        let Some(mut connect) = self.connect.take() else {
+            return;
+        };
+
+        // Keep the handshake resources alive until the explicit response has
+        // been sent. A dropped request is a server-side failure, not a silent
+        // cancellation, so use 500 rather than making the client wait for EOF.
+        let conn = self.conn.take();
+        let settings = self.settings.take();
+        let url = self.url.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                %url,
+                "dropped unanswered WebTransport request outside a Tokio runtime; \
+                 unable to send the automatic rejection"
+            );
+            return;
+        };
+
+        runtime.spawn(async move {
+            if let Err(error) = connect
+                .reject(http::StatusCode::INTERNAL_SERVER_ERROR)
+                .await
+            {
+                tracing::warn!(
+                    %url,
+                    %error,
+                    "failed to send automatic rejection for dropped WebTransport request"
+                );
+            } else {
+                tracing::warn!(
+                    %url,
+                    status = http::StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    "automatically rejected dropped unanswered WebTransport request"
+                );
+            }
+            drop((conn, settings));
+        });
     }
 }
 
