@@ -6,7 +6,7 @@
 
 # webtrans [![Crates.io][crates-badge]][crates-url] ![License][license-badge]
 
-WebTransport for native and WebAssembly.
+WebTransport implementation for native and WebAssembly.
 
 ## Compatibility
 
