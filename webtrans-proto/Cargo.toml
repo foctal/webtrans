@@ -3,6 +3,7 @@ name = "webtrans-proto"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "WebTransport protocol primitives shared across webtrans transports."
 repository = "https://github.com/foctal/webtrans"
 readme = "../README.md"
@@ -16,6 +17,9 @@ thiserror = { workspace = true }
 http = { workspace = true }
 url = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["io-util"] }
+
+[features]
+fuzzing = []
 
 [dev-dependencies]
 criterion = "0.8"

@@ -83,9 +83,10 @@ impl SendStream {
     /// Set the stream's priority.
     ///
     /// Streams with higher values are sent first, but delivery order is not guaranteed.
-    pub fn set_priority(&mut self, priority: i32) {
+    pub fn set_priority(&mut self, priority: i32) -> Result<(), Error> {
         Reflect::set(&self.stream, &"sendOrder".into(), &priority.into())
-            .expect("failed to set priority");
+            .map(|_| ())
+            .map_err(Into::into)
     }
 
     /// Block until the stream has closed and return the error code, if any.
@@ -136,11 +137,11 @@ impl SendStream {
     }
 
     fn error_unavailable() -> io::Error {
-        io::Error::new(io::ErrorKind::Other, "writer is unavailable")
+        io::Error::other("writer is unavailable")
     }
 
     fn to_io_error(error: Error) -> io::Error {
-        io::Error::new(io::ErrorKind::Other, error.to_string())
+        io::Error::other(error.to_string())
     }
 }
 
@@ -220,7 +221,7 @@ impl webtrans_trait::SendStream for SendStream {
     }
 
     fn set_priority(&mut self, order: u8) {
-        Self::set_priority(self, i32::from(order));
+        let _ = Self::set_priority(self, i32::from(order));
     }
 
     fn finish(&mut self) -> Result<(), Self::Error> {

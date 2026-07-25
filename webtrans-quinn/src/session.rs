@@ -18,7 +18,15 @@ use crate::{
     ClientError, Connect, RecvStream, SendStream, SessionError, Settings, WebTransportError,
 };
 
-use webtrans_proto::{Frame, UniStream, VarInt};
+use webtrans_proto::{Capsule, CapsuleError, Frame, UniStream, VarInt};
+
+const MAX_CAPSULE_FRAME_SIZE: usize = 2 * 1024;
+
+#[derive(Debug)]
+struct CloseCommand {
+    code: u32,
+    reason: Vec<u8>,
+}
 
 fn is_graceful_close(e: &webtrans_proto::CapsuleError) -> bool {
     use std::io::ErrorKind;
@@ -72,6 +80,10 @@ pub struct Session {
 
     // The URL used to create the session.
     url: Url,
+
+    // Local close requests are serialized through the CONNECT stream task so
+    // the peer receives a CLOSE_WEBTRANSPORT_SESSION capsule before QUIC closes.
+    close_tx: Option<tokio::sync::mpsc::UnboundedSender<CloseCommand>>,
 }
 
 impl Session {
@@ -93,30 +105,36 @@ impl Session {
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id);
+        let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel();
+        let settings = Arc::new(settings);
 
         let this = Self {
-            conn,
+            conn: conn.clone(),
             accept: Some(Arc::new(Mutex::new(accept))),
             session_id: Some(session_id),
             header_uni,
             header_bi,
             header_datagram,
             url: connect.url().clone(),
-            settings: Some(Arc::new(settings)),
+            settings: Some(settings.clone()),
+            close_tx: Some(close_tx),
         };
 
-        // Run a background task to detect CONNECT stream closure.
-        let this2 = this.clone();
+        // Run a background task to coordinate local and remote CONNECT stream
+        // closure without retaining an extra Session/close-sender clone.
         tokio::spawn(async move {
-            match this2.run_closed(connect).await {
+            let result = Self::run_closed(connect, close_rx).await;
+            // The HTTP/3 control streams are critical and must remain alive
+            // until CONNECT closure processing has completed.
+            match result {
                 Ok(Some((code, reason))) => {
                     tracing::debug!("WebTransport close received: code={code} reason={reason}");
-                    if this2.conn.close_reason().is_none() {
-                        this2.close(code, reason.as_bytes());
+                    if conn.close_reason().is_none() {
+                        Self::close_connection(&conn, code, reason.as_bytes());
                     }
                 }
                 Ok(None) => {
-                    if let Some(reason) = this2.conn.close_reason() {
+                    if let Some(reason) = conn.close_reason() {
                         let se: crate::SessionError = reason.into();
                         tracing::debug!("CONNECT stream ended: {se}");
                     } else {
@@ -124,7 +142,7 @@ impl Session {
                     }
                 }
                 Err(e) if is_graceful_close(&e) => {
-                    if let Some(reason) = this2.conn.close_reason() {
+                    if let Some(reason) = conn.close_reason() {
                         let se: crate::SessionError = reason.into();
                         tracing::debug!(
                             "CONNECT stream closed after QUIC close: {se} (capsule={e})"
@@ -135,11 +153,12 @@ impl Session {
                 }
                 Err(e) => {
                     tracing::debug!("CONNECT stream error: {e}");
-                    if this2.conn.close_reason().is_none() {
-                        this2.close(1, b"capsule error");
+                    if conn.close_reason().is_none() {
+                        Self::close_connection(&conn, 1, b"capsule error");
                     }
                 }
             }
+            drop(settings);
         });
 
         this
@@ -147,30 +166,101 @@ impl Session {
 
     // Keep reading from the control stream until it closes.
     async fn run_closed(
-        &self,
         connect: Connect,
+        mut close_rx: tokio::sync::mpsc::UnboundedReceiver<CloseCommand>,
     ) -> Result<Option<(u32, String)>, webtrans_proto::CapsuleError> {
-        let (_send, mut recv) = connect.into_inner();
+        let (mut send, mut recv) = connect.into_inner();
 
         loop {
-            match webtrans_proto::Capsule::read(&mut recv).await {
-                Ok(webtrans_proto::Capsule::CloseWebTransportSession { code, reason }) => {
-                    return Ok(Some((code, reason)));
+            tokio::select! {
+                capsule = Self::read_capsule_frame(&mut recv) => match capsule {
+                    Ok(Capsule::CloseWebTransportSession { code, reason }) => {
+                        return Ok(Some((code, reason)));
+                    }
+                    Ok(Capsule::Unknown { typ, payload }) => {
+                        tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
+                    }
+                    Err(e) if is_graceful_close(&e) => return Ok(None),
+                    Err(e) => return Err(e),
+                },
+                Some(close) = close_rx.recv() => {
+                    let reason = Self::capsule_reason(&close.reason);
+                    let capsule = Capsule::CloseWebTransportSession {
+                        code: close.code,
+                        reason,
+                    };
+                    Self::write_capsule_frame(&mut send, &capsule).await?;
+                    let _ = send.finish();
+                    let _ = send.stopped().await;
+                    return Ok(None);
                 }
-                Ok(webtrans_proto::Capsule::Unknown { typ, payload }) => {
-                    tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
-                }
-                Err(e) if is_graceful_close(&e) => return Ok(None),
-                Err(e) => return Err(e),
             }
         }
+    }
+
+    async fn read_capsule_frame(recv: &mut quinn::RecvStream) -> Result<Capsule, CapsuleError> {
+        loop {
+            let typ = VarInt::read(recv)
+                .await
+                .map_err(|_| CapsuleError::UnexpectedEnd)?;
+            let length = VarInt::read(recv)
+                .await
+                .map_err(|_| CapsuleError::UnexpectedEnd)?;
+            let length =
+                usize::try_from(length.into_inner()).map_err(|_| CapsuleError::MessageTooLong)?;
+            if length > MAX_CAPSULE_FRAME_SIZE {
+                return Err(CapsuleError::MessageTooLong);
+            }
+
+            let mut payload = vec![0; length];
+            tokio::io::AsyncReadExt::read_exact(recv, &mut payload).await?;
+            let typ = Frame(typ);
+            if typ.is_grease() {
+                continue;
+            }
+            if typ != Frame::DATA {
+                tracing::warn!("ignoring non-DATA frame on CONNECT stream: {typ:?}");
+                continue;
+            }
+            return Capsule::decode(&mut payload.as_slice());
+        }
+    }
+
+    async fn write_capsule_frame(
+        send: &mut quinn::SendStream,
+        capsule: &Capsule,
+    ) -> Result<(), CapsuleError> {
+        let mut payload = Vec::new();
+        capsule.encode(&mut payload)?;
+        let mut frame = Vec::with_capacity(VarInt::MAX_SIZE * 2 + payload.len());
+        Frame::DATA.encode(&mut frame);
+        VarInt::try_from(payload.len())
+            .map_err(|_| CapsuleError::MessageTooLong)?
+            .encode(&mut frame);
+        frame.extend_from_slice(&payload);
+        tokio::io::AsyncWriteExt::write_all(send, &frame).await?;
+        Ok(())
+    }
+
+    fn capsule_reason(reason: &[u8]) -> String {
+        let mut reason = String::from_utf8_lossy(reason).into_owned();
+        while reason.len() > 1024 {
+            reason.pop();
+        }
+        reason
+    }
+
+    fn close_connection(conn: &quinn::Connection, code: u32, reason: &[u8]) {
+        let mapped = webtrans_proto::error_to_http3(code);
+        let code = quinn::VarInt::from_u64(mapped).unwrap_or_else(|_| quinn::VarInt::from_u32(1));
+        conn.close(code, reason);
     }
 
     /// Connect using an established QUIC connection when creating the connection manually.
     /// This only works with a fresh QUIC connection negotiated with the HTTP/3 ALPN.
     pub async fn connect(conn: quinn::Connection, url: Url) -> Result<Session, ClientError> {
         // Perform the HTTP/3 handshake by sending/receiving SETTINGS frames.
-        let settings = Settings::connect(&conn).await?;
+        let settings = Settings::connect(&conn, true).await?;
 
         // Send the HTTP/3 CONNECT request.
         let connect = Connect::open(&conn, url).await?;
@@ -185,7 +275,13 @@ impl Session {
     /// Accept a new unidirectional stream. See [`quinn::Connection::accept_uni`].
     pub async fn accept_uni(&self) -> Result<RecvStream, SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_uni(cx)).await
+            poll_fn(|cx| {
+                accept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poll_accept_uni(cx)
+            })
+            .await
         } else {
             self.conn
                 .accept_uni()
@@ -198,7 +294,13 @@ impl Session {
     /// Accept a new bidirectional stream. See [`quinn::Connection::accept_bi`].
     pub async fn accept_bi(&self) -> Result<(SendStream, RecvStream), SessionError> {
         if let Some(accept) = &self.accept {
-            poll_fn(|cx| accept.lock().unwrap().poll_accept_bi(cx)).await
+            poll_fn(|cx| {
+                accept
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .poll_accept_bi(cx)
+            })
+            .await
         } else {
             self.conn
                 .accept_bi()
@@ -290,23 +392,31 @@ impl Session {
     /// Compute the maximum size of datagrams that may be passed to
     /// [`send_datagram`](Self::send_datagram).
     pub fn max_datagram_size(&self) -> usize {
-        let mtu = self
-            .conn
-            .max_datagram_size()
-            .expect("datagram support is required");
+        let mtu = self.conn.max_datagram_size().unwrap_or(0);
         mtu.saturating_sub(self.header_datagram.len())
     }
 
-    /// Immediately close the connection with an error code and reason. See [`quinn::Connection::close`].
+    /// Close the session with an error code and reason.
+    ///
+    /// WebTransport sessions first send a CLOSE_WEBTRANSPORT_SESSION capsule
+    /// from the background CONNECT task. Raw QUIC sessions close immediately.
     pub fn close(&self, code: u32, reason: &[u8]) {
-        let code: quinn::VarInt = if self.session_id.is_some() {
-            let mapped = webtrans_proto::error_to_http3(code);
-            quinn::VarInt::from_u64(mapped).unwrap_or(quinn::VarInt::from_u32(1))
-        } else {
-            quinn::VarInt::from_u32(code)
-        };
+        if let Some(close_tx) = &self.close_tx
+            && close_tx
+                .send(CloseCommand {
+                    code,
+                    reason: reason.to_vec(),
+                })
+                .is_ok()
+        {
+            return;
+        }
 
-        self.conn.close(code, reason)
+        if self.session_id.is_some() {
+            Self::close_connection(&self.conn, code, reason);
+        } else {
+            self.conn.close(quinn::VarInt::from_u32(code), reason);
+        }
     }
 
     /// Wait until the session is closed and return the error. See [`quinn::Connection::closed`].
@@ -341,6 +451,7 @@ impl Session {
             accept: None,
             settings: None,
             url,
+            close_tx: None,
         }
     }
 
@@ -589,7 +700,7 @@ impl webtrans_trait::Session for Session {
         Self::closed(self).await
     }
 
-    fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
+    async fn send_datagram(&self, data: Bytes) -> Result<(), Self::Error> {
         Self::send_datagram(self, data)
     }
 

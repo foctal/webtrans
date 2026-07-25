@@ -3,6 +3,15 @@ use wasm_bindgen::prelude::*;
 /// A WebTransport error classified by source.
 #[derive(Clone, Debug, thiserror::Error)]
 pub enum Error {
+    #[error("webtransport session closed: code={code} reason={reason}")]
+    /// Session closed cleanly with application-provided details.
+    SessionClosed {
+        /// Application close code.
+        code: u32,
+        /// Application close reason.
+        reason: String,
+    },
+
     #[error("webtransport session error: {0:?}")]
     Session(web_sys::WebTransportError),
 
@@ -20,6 +29,7 @@ impl Error {
     /// Return the error code used when closing the stream or session.
     pub fn code(&self) -> Option<u8> {
         match self {
+            Error::SessionClosed { .. } => None,
             Error::Session(e) | Error::Stream(e) => e.stream_error_code(),
             _ => None,
         }
@@ -45,6 +55,7 @@ impl From<JsValue> for Error {
 impl webtrans_trait::Error for Error {
     fn session_error(&self) -> Option<(u32, String)> {
         match self {
+            Error::SessionClosed { code, reason } => Some((*code, reason.clone())),
             Error::Session(err) => err
                 .stream_error_code()
                 .map(|code| (u32::from(code), format!("{err:?}"))),

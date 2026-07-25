@@ -11,7 +11,7 @@ use web_sys::{Document, HtmlButtonElement, HtmlInputElement};
 use webtrans_wasm::{ClientBuilder, Session};
 
 thread_local! {
-    static STATE: RefCell<Option<AppState>> = RefCell::new(None);
+    static STATE: RefCell<Option<AppState>> = const { RefCell::new(None) };
 }
 
 struct AppState {

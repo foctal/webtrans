@@ -1,8 +1,8 @@
 use anyhow::{Context, anyhow};
 use clap::Parser;
 use ring::digest::{SHA256, digest};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use std::{fs, io, path};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
+use std::{fs, path};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 use webtrans::{Request, Server, ServerBuilder, Session};
@@ -49,7 +49,14 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("listening on {}", args.addr);
 
     // Accept new connections.
-    while let Some(conn) = server.accept().await {
+    while let Some(result) = server.accept().await {
+        let conn = match result {
+            Ok(conn) => conn,
+            Err(error) => {
+                tracing::warn!("failed to accept WebTransport request: {error}");
+                continue;
+            }
+        };
         tokio::spawn(async move {
             let err = run_conn(conn).await;
             if let Err(err) = err {
@@ -67,22 +74,17 @@ fn load_or_generate_certs(
     match (&args.tls_cert, &args.tls_key) {
         (Some(cert_path), Some(key_path)) => {
             // Read the PEM certificate chain.
-            let chain_file = fs::File::open(cert_path).context("failed to open cert file")?;
-            let mut chain_reader = io::BufReader::new(chain_file);
-
-            let chain: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut chain_reader)
+            let cert_pem = fs::read(cert_path).context("failed to read cert file")?;
+            let chain: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_pem)
                 .collect::<Result<_, _>>()
                 .context("failed to load certs")?;
 
             anyhow::ensure!(!chain.is_empty(), "could not find certificate");
 
             // Read the PEM private key.
-            let key_file = fs::File::open(key_path).context("failed to open key file")?;
-            let mut key_reader = io::BufReader::new(key_file);
-
-            let key = rustls_pemfile::private_key(&mut key_reader)
-                .context("failed to load private key")?
-                .context("missing private key")?;
+            let key_pem = fs::read(key_path).context("failed to read private key file")?;
+            let key =
+                PrivateKeyDer::from_pem_slice(&key_pem).context("failed to load private key")?;
 
             tracing::info!(
                 "loaded certificate from {} and key from {}",
@@ -91,7 +93,7 @@ fn load_or_generate_certs(
             );
 
             let leaf = chain
-                .get(0)
+                .first()
                 .ok_or_else(|| anyhow!("certificate chain is empty"))?;
 
             tracing::info!(
@@ -118,7 +120,7 @@ fn load_or_generate_certs(
                 .map_err(|e| anyhow!("failed to generate self-signed certs: {e}"))?;
 
             let leaf = chain
-                .get(0)
+                .first()
                 .ok_or_else(|| anyhow!("certificate chain is empty"))?;
 
             tracing::info!(

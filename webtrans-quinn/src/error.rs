@@ -43,6 +43,22 @@ pub enum ClientError {
     #[error("invalid url: {0}")]
     InvalidUrl(String),
 
+    /// DNS resolution exceeded the configured timeout.
+    #[error("DNS resolution timed out")]
+    DnsTimeout,
+
+    /// QUIC and HTTP/3 session establishment exceeded the configured timeout.
+    #[error("connection handshake timed out")]
+    HandshakeTimeout,
+
+    /// Local UDP endpoint creation failed.
+    #[error("io error: {0}")]
+    Io(Arc<std::io::Error>),
+
+    /// TLS configuration did not provide a QUIC-compatible initial cipher suite.
+    #[error("TLS configuration has no QUIC-compatible initial cipher suite")]
+    InvalidCryptoConfiguration,
+
     #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
     /// Rustls-level TLS configuration or handshake error.
     #[error("rustls error: {0}")]
@@ -236,6 +252,10 @@ impl From<quinn::ClosedStream> for ClosedStream {
 /// Error returned when receiving a new WebTransport session.
 #[derive(Error, Debug, Clone)]
 pub enum ServerError {
+    /// A request no longer owns the handshake state needed to complete it.
+    #[error("WebTransport request was already completed")]
+    RequestAlreadyCompleted,
+
     /// Incoming bytes ended before the handshake exchange completed.
     #[error("unexpected end of stream")]
     UnexpectedEnd,
@@ -243,6 +263,10 @@ pub enum ServerError {
     /// QUIC connection-level failure.
     #[error("connection error")]
     Connection(#[from] quinn::ConnectionError),
+
+    /// QUIC and HTTP/3 session establishment exceeded the configured timeout.
+    #[error("connection handshake timed out")]
+    HandshakeTimeout,
 
     /// Failed to write handshake data.
     #[error("failed to write")]
@@ -263,6 +287,10 @@ pub enum ServerError {
     /// Generic I/O failure during server setup or handshake.
     #[error("io error: {0}")]
     IoError(Arc<std::io::Error>),
+
+    /// TLS configuration did not provide a QUIC-compatible initial cipher suite.
+    #[error("TLS configuration has no QUIC-compatible initial cipher suite")]
+    InvalidCryptoConfiguration,
 
     #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
     /// Rustls-level TLS configuration or handshake error.

@@ -36,8 +36,11 @@ pub struct Settings {
 
 impl Settings {
     // Establish the HTTP/3 SETTINGS exchange.
-    pub async fn connect(conn: &quinn::Connection) -> Result<Self, SettingsError> {
-        let recv = Self::accept(conn);
+    pub async fn connect(
+        conn: &quinn::Connection,
+        peer_is_server: bool,
+    ) -> Result<Self, SettingsError> {
+        let recv = Self::accept(conn, peer_is_server);
         let send = Self::open(conn);
 
         // Run both tasks concurrently until one errors or both complete.
@@ -45,13 +48,21 @@ impl Settings {
         Ok(Self { send, recv })
     }
 
-    async fn accept(conn: &quinn::Connection) -> Result<quinn::RecvStream, SettingsError> {
+    async fn accept(
+        conn: &quinn::Connection,
+        peer_is_server: bool,
+    ) -> Result<quinn::RecvStream, SettingsError> {
         let mut recv = conn.accept_uni().await?;
         let settings = webtrans_proto::Settings::read(&mut recv).await?;
 
         tracing::debug!("received SETTINGS frame: {settings:?}");
 
-        if settings.supports_webtransport() == 0 {
+        let supported = if peer_is_server {
+            settings.supports_webtransport_server()
+        } else {
+            settings.supports_webtransport_client()
+        };
+        if !supported {
             return Err(SettingsError::WebTransportUnsupported);
         }
 

@@ -3,6 +3,7 @@ name = "webtrans"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "WebTransport library for native and WebAssembly"
 repository = "https://github.com/foctal/webtrans"
 readme = "../README.md"
@@ -23,7 +24,6 @@ webtrans-wasm = { workspace = true }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
-rustls-pemfile = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"

@@ -10,15 +10,16 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["shellrow <shellrow@foctal.com>"]
+rust-version = "1.85"
 
 [workspace.dependencies]
-webtrans-proto = { path = "webtrans-proto", version = "0.4.0" }
-webtrans-trait = { path = "webtrans-trait", version = "0.4.0" }
-webtrans-quinn = { path = "webtrans-quinn", version = "0.4.0" }
-webtrans-wasm = { path = "webtrans-wasm", version = "0.4.0" }
+webtrans-proto = { path = "webtrans-proto", version = "0.5.0" }
+webtrans-trait = { path = "webtrans-trait", version = "0.5.0" }
+webtrans-quinn = { path = "webtrans-quinn", version = "0.5.0" }
+webtrans-wasm = { path = "webtrans-wasm", version = "0.5.0" }
 bytes = "1"
 thiserror = "2"
 http = "1"

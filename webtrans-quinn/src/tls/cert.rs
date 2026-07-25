@@ -1,6 +1,7 @@
 //! Certificate handling utilities.
 
 use rustls::client::danger::ServerCertVerifier;
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::{fs, path::Path, sync::Arc};
 use webtrans_proto::{Error, Result};
@@ -22,13 +23,13 @@ pub fn get_native_certs() -> Result<rustls::RootCertStore> {
 pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
     let cert_bytes = fs::read(cert_path).map_err(|e| Error::Io(e.to_string()))?;
 
-    if cert_path.extension().map_or(false, |x| x == "der") {
+    if cert_path.extension().is_some_and(|x| x == "der") {
         return Ok(vec![CertificateDer::from(cert_bytes)]);
     }
 
-    rustls_pemfile::certs(&mut &*cert_bytes)
-        .collect::<std::result::Result<Vec<_>, std::io::Error>>()
-        .map_err(|e| Error::Io(e.to_string()))
+    CertificateDer::pem_slice_iter(&cert_bytes)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|e| Error::Tls(e.to_string()))
 }
 
 /// Dummy certificate verifier that treats any certificate as valid.
@@ -37,9 +38,9 @@ pub fn load_certs(cert_path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 pub struct SkipServerVerification(Arc<rustls::crypto::CryptoProvider>);
 
 impl SkipServerVerification {
-    /// Default provider: ring.
+    /// Use the crate's selected default crypto provider.
     pub fn new() -> Arc<Self> {
-        Self::with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        Self::with_provider(crate::crypto::default_provider())
     }
 
     /// Create a verifier backed by the provided crypto provider.

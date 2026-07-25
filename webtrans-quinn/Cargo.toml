@@ -3,6 +3,7 @@ name = "webtrans-quinn"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "Native WebTransport implementation built on top of QUIC using Quinn."
 repository = "https://github.com/foctal/webtrans"
 readme = "../README.md"
@@ -18,12 +19,11 @@ http = { workspace = true }
 url = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["io-util", "macros"] }
+tokio = { version = "1", default-features = false, features = ["io-util", "macros", "sync", "time"] }
 quinn = { version = "0.11", default-features = false, features = ["platform-verifier", "runtime-tokio", "bloom"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
 rustls-native-certs = "0.8"
 rcgen = "0.14"
-rustls-pemfile = "2.2"
 webtrans-proto = { workspace = true }
 webtrans-trait = { workspace = true }
 
@@ -31,3 +31,6 @@ webtrans-trait = { workspace = true }
 default = ["ring"]
 ring = ["quinn/rustls-ring", "rustls/ring"]
 aws-lc-rs = ["quinn/rustls-aws-lc-rs", "rustls/aws-lc-rs"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }

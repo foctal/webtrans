@@ -3,6 +3,7 @@ name = "webtrans-trait"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "Async WebTransport trait for webtrans transports."
 repository = "https://github.com/foctal/webtrans"
 readme = "../README.md"

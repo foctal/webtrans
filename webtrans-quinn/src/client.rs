@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 use quinn::crypto::rustls::QuicClientConfig;
@@ -32,8 +33,9 @@ pub enum CongestionControl {
 /// This is optional; advanced users may use [Client::new] directly.
 pub struct ClientBuilder {
     provider: crypto::Provider,
-    congestion_controller:
-        Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>>,
+    transport: quinn::TransportConfig,
+    dns_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
 }
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
@@ -42,22 +44,47 @@ impl ClientBuilder {
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
-            congestion_controller: None,
+            transport: quinn::TransportConfig::default(),
+            dns_timeout: None,
+            handshake_timeout: None,
         }
     }
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(quinn::congestion::NewRenoConfig::default()))
-            }
-            CongestionControl::Throughput => {
-                Some(Arc::new(quinn::congestion::BbrConfig::default()))
-            }
-            CongestionControl::Default => None,
+        match algorithm {
+            CongestionControl::LowLatency => self.transport.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            ),
+            CongestionControl::Throughput => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+            CongestionControl::Default => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
         };
 
+        self
+    }
+
+    /// Replace the QUIC transport configuration.
+    ///
+    /// Use this to configure idle timeouts, receive windows, concurrent stream
+    /// limits, datagram buffers, and other transport resource limits.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Limit how long DNS resolution may take.
+    pub fn with_dns_timeout(mut self, timeout: Duration) -> Self {
+        self.dns_timeout = Some(timeout);
+        self
+    }
+
+    /// Limit the combined QUIC, HTTP/3 SETTINGS, and CONNECT handshake duration.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
         self
     }
 
@@ -80,7 +107,7 @@ impl ClientBuilder {
         }
 
         let crypto = self
-            .builder()
+            .builder()?
             .with_root_certificates(roots)
             .with_no_client_auth();
 
@@ -113,7 +140,7 @@ impl ClientBuilder {
 
         // Configure the crypto client.
         let crypto = self
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(fingerprints.clone())
             .with_no_client_auth();
@@ -130,29 +157,31 @@ impl ClientBuilder {
         DangerousClientBuilder { inner: self }
     }
 
-    fn builder(&self) -> rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier> {
+    fn builder(
+        &self,
+    ) -> Result<rustls::ConfigBuilder<rustls::ClientConfig, rustls::WantsVerifier>, ClientError>
+    {
         rustls::ClientConfig::builder_with_provider(self.provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])
-            .unwrap()
+            .map_err(Into::into)
     }
 
     fn build(self, mut crypto: rustls::ClientConfig) -> Result<Client, ClientError> {
         crypto.alpn_protocols = vec![ALPN.as_bytes().to_vec()];
 
-        let client_config = QuicClientConfig::try_from(crypto).unwrap();
+        let client_config = QuicClientConfig::try_from(crypto)
+            .map_err(|_| ClientError::InvalidCryptoConfiguration)?;
         let mut client_config = quinn::ClientConfig::new(Arc::new(client_config));
 
-        let mut transport = quinn::TransportConfig::default();
-        if let Some(cc) = &self.congestion_controller {
-            transport.congestion_controller_factory(cc.clone());
-        }
+        client_config.transport_config(Arc::new(self.transport));
 
-        client_config.transport_config(transport.into());
-
-        let client = quinn::Endpoint::client("[::]:0".parse().unwrap()).unwrap();
+        let client = quinn::Endpoint::client(SocketAddr::from(([0_u16; 8], 0)))
+            .map_err(|error| ClientError::Io(Arc::new(error)))?;
         Ok(Client {
             endpoint: client,
             config: client_config,
+            dns_timeout: self.dns_timeout,
+            handshake_timeout: self.handshake_timeout,
         })
     }
 }
@@ -188,7 +217,7 @@ impl DangerousClientBuilder {
 
         let crypto = self
             .inner
-            .builder()
+            .builder()?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(noop))
             .with_no_client_auth();
@@ -202,6 +231,8 @@ impl DangerousClientBuilder {
 pub struct Client {
     endpoint: quinn::Endpoint,
     config: quinn::ClientConfig,
+    dns_timeout: Option<Duration>,
+    handshake_timeout: Option<Duration>,
 }
 
 impl Client {
@@ -209,18 +240,18 @@ impl Client {
     ///
     /// The ALPN must be set to [ALPN].
     pub fn new(endpoint: quinn::Endpoint, config: quinn::ClientConfig) -> Self {
-        Self { endpoint, config }
+        Self {
+            endpoint,
+            config,
+            dns_timeout: None,
+            handshake_timeout: None,
+        }
     }
 
     /// Connect to the server.
     pub async fn connect(&self, url: Url) -> Result<Session, ClientError> {
+        validate_url(&url)?;
         let port = url.port().unwrap_or(443);
-
-        if !url.username().is_empty() || url.password().is_some() {
-            return Err(ClientError::InvalidUrl(
-                "userinfo is not supported in the authority".to_string(),
-            ));
-        }
 
         let (host, remote) = match url
             .host()
@@ -229,7 +260,14 @@ impl Client {
             Host::Domain(domain) => {
                 let domain = domain.to_string();
                 // Look up the DNS entry.
-                let mut remotes = match lookup_host((domain.clone(), port)).await {
+                let lookup = lookup_host((domain.clone(), port));
+                let result = match self.dns_timeout {
+                    Some(timeout) => tokio::time::timeout(timeout, lookup)
+                        .await
+                        .map_err(|_| ClientError::DnsTimeout)?,
+                    None => lookup.await,
+                };
+                let mut remotes = match result {
                     Ok(remotes) => remotes,
                     Err(_) => return Err(ClientError::InvalidDnsName(domain)),
                 };
@@ -247,21 +285,45 @@ impl Client {
         };
 
         // Connect to the server using the resolved address.
-        let conn = self
+        let connecting = self
             .endpoint
             .connect_with(self.config.clone(), remote, &host)?;
-        let conn = conn.await?;
+        let establish = async move {
+            let conn = connecting.await?;
+            Session::connect(conn, url).await
+        };
 
-        // Complete WebTransport connection establishment.
-        Session::connect(conn, url).await
+        match self.handshake_timeout {
+            Some(timeout) => tokio::time::timeout(timeout, establish)
+                .await
+                .map_err(|_| ClientError::HandshakeTimeout)?,
+            None => establish.await,
+        }
     }
 }
 
-#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
-impl Default for Client {
-    fn default() -> Self {
-        ClientBuilder::new().with_system_roots().unwrap()
+fn validate_url(url: &Url) -> Result<(), ClientError> {
+    if url.scheme() != "https" {
+        return Err(ClientError::InvalidUrl(
+            "WebTransport requires an https URL".to_string(),
+        ));
     }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(ClientError::InvalidUrl(
+            "userinfo is not supported in the authority".to_string(),
+        ));
+    }
+    if url.fragment().is_some() {
+        return Err(ClientError::InvalidUrl(
+            "URL fragments are not sent in HTTP request targets".to_string(),
+        ));
+    }
+    if url.cannot_be_a_base() || url.host().is_none() {
+        return Err(ClientError::InvalidUrl(
+            "URL must contain a valid authority and path".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg_attr(not(any(feature = "ring", feature = "aws-lc-rs")), allow(dead_code))]
@@ -377,5 +439,27 @@ impl rustls::client::danger::ServerCertVerifier for NoCertificateVerification {
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_webtransport_urls() {
+        assert!(validate_url(&Url::parse("https://example.com/chat").unwrap()).is_ok());
+        assert!(validate_url(&Url::parse("http://example.com/chat").unwrap()).is_err());
+        assert!(validate_url(&Url::parse("https://user@example.com/chat").unwrap()).is_err());
+        assert!(validate_url(&Url::parse("https://example.com/chat#fragment").unwrap()).is_err());
+    }
+
+    #[test]
+    fn builder_records_operation_timeouts() {
+        let builder = ClientBuilder::new()
+            .with_dns_timeout(Duration::from_secs(2))
+            .with_handshake_timeout(Duration::from_secs(7));
+        assert_eq!(builder.dns_timeout, Some(Duration::from_secs(2)));
+        assert_eq!(builder.handshake_timeout, Some(Duration::from_secs(7)));
     }
 }

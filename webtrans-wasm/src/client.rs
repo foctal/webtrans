@@ -77,6 +77,6 @@ impl Client {
         let inner = WebTransport::new_with_options(url.as_str(), &self.options)?;
         JsFuture::from(inner.ready()).await?;
 
-        Ok(Session::new(inner, url))
+        Session::new(inner, url)
     }
 }

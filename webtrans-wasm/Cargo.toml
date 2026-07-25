@@ -3,6 +3,7 @@ name = "webtrans-wasm"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 description = "WebTransport wrapper for WebAssembly."
 repository = "https://github.com/foctal/webtrans"
 readme = "../README.md"
@@ -17,6 +18,7 @@ rustdoc-args = ["--cfg=web_sys_unstable_apis"]
 
 [dependencies]
 bytes = { workspace = true }
+futures = "0.3"
 futures-io = "0.3"
 js-sys = "0.3.88"
 thiserror = { workspace = true }
@@ -30,6 +32,7 @@ webtrans-trait = { workspace = true }
 version = "0.3.88"
 features = [
     "ReadableStream",
+    "ReadableStreamDefaultController",
     "ReadableStreamDefaultReader",
     "ReadableStreamReadResult",
     "WebTransport",
@@ -47,3 +50,6 @@ features = [
     "WritableStream",
     "WritableStreamDefaultWriter",
 ]
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"

@@ -5,40 +5,190 @@
 [examples-url]: https://github.com/foctal/webtrans/tree/main/webtrans/examples
 
 # webtrans [![Crates.io][crates-badge]][crates-url] ![License][license-badge]
-Rust implementation of the WebTransport protocol 
-for native (QUIC/HTTP3 via Quinn) and WebAssembly (browser WebTransport API) targets.
 
-## Workspace crates
+WebTransport for native Rust (QUIC/HTTP/3 through Quinn) and WebAssembly
+(the browser WebTransport API).
 
-- `webtrans` - top-level facade that selects native (`webtrans-quinn`) or WASM (`webtrans-wasm`).
-- `webtrans-proto` - protocol primitives.
-- `webtrans-quinn` - native client/server implementation on top of `quinn`.
-- `webtrans-trait` - shared traits for sessions and streams.
-- `webtrans-wasm` - browser WebTransport bindings for WASM.
-- `webtrans-wasm-demo` - simple WASM demo crate.
+## Compatibility
 
-## Quick start
+The native transport implements the WebTransport over HTTP/3 negotiation and
+wire formats used by `draft-ietf-webtrans-http3-16`, with legacy upgrade-token
+acceptance for older peers. Quinn does not yet expose the draft-16
+RESET_STREAM_AT extension, so native support is draft-compatible rather than
+fully draft-16 compliant. Native applications can inspect
+`webtrans_quinn::RESET_STREAM_AT_SUPPORTED`; it remains `false` until Quinn
+provides the required transport extension.
+
+The WASM transport requires a browser that provides the global `WebTransport`
+API in a secure context. Browser certificate and network policy still apply.
+Check the target browsers used by your application because WebTransport
+availability can differ by browser and deployment environment.
+
+## Installation
+
+The workspace MSRV is Rust 1.85.
 
 ```toml
 [dependencies]
 webtrans = "0.4"
 ```
 
-API documentation is available on [docs.rs][doc-url].
+API documentation is available on [docs.rs][doc-url]. Depend directly on
+`webtrans-quinn`, `webtrans-wasm`, `webtrans-proto`, or `webtrans-trait` when
+transport-specific APIs are required.
 
-If you need transport-specific features, depend on one of the transport crates directly.
+## Native client
 
-### Native
-See [examples][examples-url]
+Use system roots for public servers. Pin a certificate or SHA-256 certificate
+hash when connecting to a development server with a private certificate.
+Disabling verification is intentionally behind `dangerous()` and should only
+be used for controlled local development.
 
-### WebAssembly
+```rust,no_run
+use std::time::Duration;
+use url::Url;
+use webtrans::ClientBuilder;
 
-The `webtrans-wasm-demo` crate contains a small browser demo that connects to an echo server.
+# async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+let client = ClientBuilder::new()
+    .with_dns_timeout(Duration::from_secs(5))
+    .with_handshake_timeout(Duration::from_secs(10))
+    .with_system_roots()?;
+
+let session = client
+    .connect(Url::parse("https://example.com/webtransport")?)
+    .await?;
+let (mut send, _recv) = session.open_bi().await?;
+send.write_all(b"hello").await?;
+send.finish()?;
+# Ok(())
+# }
+```
+
+## Native server and resource limits
+
+Quinn's `TransportConfig` controls per-connection idle time, stream limits,
+flow-control windows, and datagram buffers. Pending handshakes have a separate
+endpoint-wide limit.
+
+```rust,no_run
+use std::{num::NonZeroUsize, time::Duration};
+use webtrans::{ServerBuilder, quinn};
+
+# fn build(
+#     chain: Vec<webtrans::quinn::rustls::pki_types::CertificateDer<'static>>,
+#     key: webtrans::quinn::rustls::pki_types::PrivateKeyDer<'static>,
+# ) -> Result<(), Box<dyn std::error::Error>> {
+let mut transport = quinn::quinn::TransportConfig::default();
+transport
+    .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
+    .max_concurrent_bidi_streams(128_u32.into())
+    .max_concurrent_uni_streams(128_u32.into())
+    .stream_receive_window((512_u32 * 1024).into())
+    .receive_window((2_u32 * 1024 * 1024).into())
+    .datagram_receive_buffer_size(Some(1024 * 1024));
+
+let mut server = ServerBuilder::new()
+    .with_transport_config(transport)
+    .with_handshake_timeout(Duration::from_secs(10))
+    .with_max_pending_handshakes(NonZeroUsize::new(256).unwrap())
+    .with_certificate(chain, key)?;
+
+# async move {
+while let Some(result) = server.accept().await {
+    let request = match result {
+        Ok(request) => request,
+        Err(error) => {
+            eprintln!("handshake failed: {error}");
+            continue;
+        }
+    };
+    tokio::spawn(async move {
+        if request.url().path() == "/webtransport" {
+            let _session = request.ok().await;
+        } else {
+            let _ = request
+                .close(webtrans::quinn::http::StatusCode::NOT_FOUND)
+                .await;
+        }
+    });
+}
+# };
+# Ok(())
+# }
+```
+
+Every accepted `Request` must be completed with `Request::ok` or
+`Request::close`. Dropping an unanswered request automatically sends
+`500 Internal Server Error` and emits a tracing event. If the request is
+dropped after leaving its Tokio runtime, the response cannot be scheduled and
+an error event is emitted instead.
+
+Choose limits from a memory budget and expected bandwidth-delay product. In
+particular, worst-case receive memory grows with the number of connections,
+concurrent streams, receive windows, and buffered datagrams. Applications
+should also bound their own stream payloads and operation durations.
+
+Complete runnable programs, including PEM certificate loading and a local
+self-signed setup, are in the [examples directory][examples-url]:
+
+```bash
+cargo run -p webtrans --example echo-server
+cargo run -p webtrans --example echo-client
+```
+
+## WebAssembly
+
+The `webtrans-wasm-demo` crate contains a browser example. Build the facade and
+WASM crates with:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown -p webtrans -p webtrans-wasm
+```
+
+## Workspace crates
+
+- `webtrans`: target-selecting facade.
+- `webtrans-proto`: bounded protocol primitives and HTTP/3 field validation.
+- `webtrans-quinn`: native client/server implementation.
+- `webtrans-trait`: transport-agnostic session and stream traits.
+- `webtrans-wasm`: browser bindings.
+- `webtrans-wasm-demo`: browser demo.
+
+## Versioning and support
+
+The crates follow Semantic Versioning as a coordinated workspace. Before 1.0,
+a minor release may contain public API changes; patch releases remain
+backward-compatible unless a security or soundness issue requires otherwise.
+The MSRV may increase in a minor release and is recorded in `Cargo.toml` and
+the changelog. Supported versions and vulnerability reporting are documented
+in [SECURITY.md](SECURITY.md).
 
 ## Benchmarking
 
-Criterion benchmarks are available for webtrans-proto.
+Criterion benchmarks are available for `webtrans-proto`:
 
 ```bash
 cargo bench -p webtrans-proto
 ```
+
+## Fuzzing and interoperability
+
+Decoder fuzz targets and their seeded corpora are in `fuzz/`:
+
+```bash
+cargo check --manifest-path fuzz/Cargo.toml --all-targets
+cd fuzz
+cargo fuzz run varint
+```
+
+The independent native interoperability suite uses `wtransport`:
+
+```bash
+cargo test --manifest-path interop/Cargo.toml
+```
+
+The dedicated interoperability workflow additionally installs the current
+Playwright Chromium build and covers bidirectional and unidirectional streams,
+datagrams, close codes and reasons, rejected requests, and reconnects.

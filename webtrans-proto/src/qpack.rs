@@ -1,6 +1,6 @@
 //! Minimal QPACK support for WebTransport that focuses on static-table encoding.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bytes::{Buf, BufMut};
 
@@ -21,18 +21,30 @@ pub enum DecodeError {
     #[error("unknown entry")]
     UnknownEntry,
 
+    #[error("invalid HTTP field name")]
+    InvalidFieldName,
+
+    #[error("invalid HTTP field value")]
+    InvalidFieldValue,
+
+    #[error("pseudo-header field appeared after a regular field")]
+    PseudoHeaderAfterRegularField,
+
+    #[error("duplicate pseudo-header field: {0}")]
+    DuplicatePseudoHeader(String),
+
+    #[error("pseudo-header field is not valid in this message: {0}")]
+    InvalidPseudoHeader(String),
+
+    #[error("connection-specific field is forbidden in HTTP/3: {0}")]
+    ConnectionSpecificField(String),
+
     #[error("huffman decoding error")]
     HuffmanError(#[from] huffman::Error),
 
     #[error("invalid utf8 header")] // Stricter than the HTTP spec, but enforced for safety.
     Utf8Error(#[from] std::str::Utf8Error),
 }
-
-#[cfg(target_pointer_width = "64")]
-const MAX_POWER: usize = 10 * 7;
-
-#[cfg(target_pointer_width = "32")]
-const MAX_POWER: usize = 5 * 7;
 
 // Simple QPACK implementation that only supports the static table and literals.
 #[derive(Debug, Default)]
@@ -50,11 +62,17 @@ impl Headers {
     }
 
     pub fn decode<B: Buf>(mut buf: &mut B) -> Result<Self, DecodeError> {
-        // Dynamic table instructions are unsupported, so ignore the insert counts.
-        let (_, _insert_count) = decode_prefix(buf, 8)?;
-        let (_sign, _delta_base) = decode_prefix(buf, 7)?;
+        // This implementation has no dynamic table. A non-zero Required Insert
+        // Count or Delta Base therefore cannot be resolved safely.
+        let (_, insert_count) = decode_prefix(buf, 8)?;
+        let (sign, delta_base) = decode_prefix(buf, 7)?;
+        if insert_count != 0 || sign != 0 || delta_base != 0 {
+            return Err(DecodeError::DynamicEntry);
+        }
 
         let mut fields = HashMap::new();
+        let mut pseudo_headers = HashSet::new();
+        let mut saw_regular_field = false;
         while buf.has_remaining() {
             // Read the first byte to determine the field representation.
             let peek = buf.get_u8();
@@ -95,6 +113,17 @@ impl Headers {
                 },
             };
 
+            validate_field(&name, &value)?;
+            if name.starts_with(':') {
+                if saw_regular_field {
+                    return Err(DecodeError::PseudoHeaderAfterRegularField);
+                }
+                if !pseudo_headers.insert(name.clone()) {
+                    return Err(DecodeError::DuplicatePseudoHeader(name));
+                }
+            } else {
+                saw_regular_field = true;
+            }
             fields.insert(name, value);
 
             // Recover the original buffer after chained parsing.
@@ -102,6 +131,17 @@ impl Headers {
         }
 
         Ok(Self { fields })
+    }
+
+    pub(crate) fn validate_pseudo_headers(&self, allowed: &[&str]) -> Result<(), DecodeError> {
+        if let Some(name) = self
+            .fields
+            .keys()
+            .find(|name| name.starts_with(':') && !allowed.contains(&name.as_str()))
+        {
+            return Err(DecodeError::InvalidPseudoHeader(name.clone()));
+        }
+        Ok(())
     }
 
     fn decode_index<B: Buf>(buf: &mut B) -> Result<(String, String), DecodeError> {
@@ -233,6 +273,54 @@ impl Headers {
     }
 }
 
+fn validate_field(name: &str, value: &str) -> Result<(), DecodeError> {
+    let regular_name = name.strip_prefix(':').unwrap_or(name);
+    if regular_name.is_empty() || !regular_name.bytes().all(is_lowercase_field_name_byte) {
+        return Err(DecodeError::InvalidFieldName);
+    }
+
+    if value.bytes().any(|byte| {
+        byte == 0x7f || byte == b'\r' || byte == b'\n' || (byte < 0x20 && byte != b'\t')
+    }) {
+        return Err(DecodeError::InvalidFieldValue);
+    }
+
+    if matches!(
+        name,
+        "connection" | "proxy-connection" | "keep-alive" | "transfer-encoding" | "upgrade"
+    ) {
+        return Err(DecodeError::ConnectionSpecificField(name.to_string()));
+    }
+    if name == "te" && !value.trim().eq_ignore_ascii_case("trailers") {
+        return Err(DecodeError::ConnectionSpecificField(name.to_string()));
+    }
+
+    Ok(())
+}
+
+fn is_lowercase_field_name_byte(byte: u8) -> bool {
+    matches!(
+        byte,
+        b'a'..=b'z'
+            | b'0'..=b'9'
+            | b'!'
+            | b'#'
+            | b'$'
+            | b'%'
+            | b'&'
+            | b'\''
+            | b'*'
+            | b'+'
+            | b'-'
+            | b'.'
+            | b'^'
+            | b'_'
+            | b'`'
+            | b'|'
+            | b'~'
+    )
+}
+
 // Prefix integer encoding: fixed-width when small, variable-length when larger.
 // https://www.rfc-editor.org/rfc/rfc7541#section-5.1
 
@@ -266,16 +354,21 @@ pub fn decode_prefix<B: Buf>(buf: &mut B, size: u8) -> Result<(u8, usize), Decod
         }
 
         let byte = buf.get_u8() as usize;
-        value += (byte & 127) << power;
-        power += 7;
+        if power >= usize::BITS as usize {
+            return Err(DecodeError::BoundsExceeded);
+        }
+        let increment = (byte & 127)
+            .checked_shl(power as u32)
+            .ok_or(DecodeError::BoundsExceeded)?;
+        value = value
+            .checked_add(increment)
+            .ok_or(DecodeError::BoundsExceeded)?;
 
         if byte & 128 == 0 {
             break;
         }
 
-        if power >= MAX_POWER {
-            return Err(DecodeError::BoundsExceeded);
-        }
+        power = power.checked_add(7).ok_or(DecodeError::BoundsExceeded)?;
     }
 
     Ok((flags, value))
@@ -483,3 +576,103 @@ const PREDEFINED_HEADERS: [(&str, &str); 99] = [
     ("x-frame-options", "deny"),
     ("x-frame-options", "sameorigin"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_prefix_returns_error_without_panicking() {
+        let mut input = [0xff; 16].as_slice();
+        assert!(matches!(
+            decode_prefix(&mut input, 7),
+            Err(DecodeError::BoundsExceeded)
+        ));
+    }
+
+    fn encoded_literal_fields(fields: &[(&str, &str)]) -> Vec<u8> {
+        let mut encoded = vec![0, 0];
+        for (name, value) in fields {
+            Headers::encode_literal(&mut encoded, name, value);
+        }
+        encoded
+    }
+
+    #[test]
+    fn rejects_dynamic_table_prefix() {
+        assert!(matches!(
+            Headers::decode(&mut [1, 0].as_slice()),
+            Err(DecodeError::DynamicEntry)
+        ));
+        assert!(matches!(
+            Headers::decode(&mut [0, 1].as_slice()),
+            Err(DecodeError::DynamicEntry)
+        ));
+        assert!(matches!(
+            Headers::decode(&mut [0, 0x80].as_slice()),
+            Err(DecodeError::DynamicEntry)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_field_names_and_values() {
+        let uppercase = encoded_literal_fields(&[("Content-Type", "text/plain")]);
+        assert!(matches!(
+            Headers::decode(&mut uppercase.as_slice()),
+            Err(DecodeError::InvalidFieldName)
+        ));
+
+        let newline = encoded_literal_fields(&[("x-test", "one\ntwo")]);
+        assert!(matches!(
+            Headers::decode(&mut newline.as_slice()),
+            Err(DecodeError::InvalidFieldValue)
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_pseudo_header_order_and_duplicates() {
+        let out_of_order = encoded_literal_fields(&[("x-test", "1"), (":path", "/")]);
+        assert!(matches!(
+            Headers::decode(&mut out_of_order.as_slice()),
+            Err(DecodeError::PseudoHeaderAfterRegularField)
+        ));
+
+        let duplicate = encoded_literal_fields(&[(":path", "/one"), (":path", "/two")]);
+        assert!(matches!(
+            Headers::decode(&mut duplicate.as_slice()),
+            Err(DecodeError::DuplicatePseudoHeader(name)) if name == ":path"
+        ));
+    }
+
+    #[test]
+    fn rejects_http3_connection_specific_fields() {
+        for (name, value) in [
+            ("connection", "close"),
+            ("proxy-connection", "close"),
+            ("keep-alive", "timeout=5"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("te", "gzip"),
+        ] {
+            let encoded = encoded_literal_fields(&[(name, value)]);
+            assert!(matches!(
+                Headers::decode(&mut encoded.as_slice()),
+                Err(DecodeError::ConnectionSpecificField(_))
+            ));
+        }
+
+        let trailers = encoded_literal_fields(&[("te", "trailers")]);
+        assert!(Headers::decode(&mut trailers.as_slice()).is_ok());
+    }
+
+    #[test]
+    fn validates_message_specific_pseudo_headers() {
+        let encoded = encoded_literal_fields(&[(":status", "200")]);
+        let headers = Headers::decode(&mut encoded.as_slice()).unwrap();
+        assert!(headers.validate_pseudo_headers(&[":status"]).is_ok());
+        assert!(matches!(
+            headers.validate_pseudo_headers(&[":method"]),
+            Err(DecodeError::InvalidPseudoHeader(name)) if name == ":status"
+        ));
+    }
+}

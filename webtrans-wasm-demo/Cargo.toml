@@ -3,6 +3,7 @@ name = "webtrans-wasm-demo"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
+rust-version.workspace = true
 publish = false
 
 [lib]

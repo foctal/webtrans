@@ -62,7 +62,7 @@ fn bench_capsule(c: &mut Criterion) {
     c.bench_function("capsule/encode_decode", |b| {
         b.iter(|| {
             let mut encoded = Vec::new();
-            black_box(&capsule).encode(&mut encoded);
+            black_box(&capsule).encode(&mut encoded).unwrap();
 
             let mut src = encoded.as_slice();
             let decoded = Capsule::decode(&mut src).unwrap();

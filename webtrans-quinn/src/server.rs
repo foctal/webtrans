@@ -2,6 +2,7 @@
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 use std::sync::Arc;
+use std::{num::NonZeroUsize, time::Duration};
 
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
@@ -19,8 +20,9 @@ use crate::{Connect, ServerError, Session, Settings};
 pub struct ServerBuilder {
     provider: crypto::Provider,
     addr: std::net::SocketAddr,
-    congestion_controller:
-        Option<Arc<dyn quinn::congestion::ControllerFactory + Send + Sync + 'static>>,
+    transport: quinn::TransportConfig,
+    handshake_timeout: Option<Duration>,
+    max_pending_handshakes: NonZeroUsize,
 }
 
 #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
@@ -36,8 +38,10 @@ impl ServerBuilder {
     pub fn new() -> Self {
         Self {
             provider: crypto::default_provider(),
-            addr: "[::]:443".parse().unwrap(),
-            congestion_controller: None,
+            addr: std::net::SocketAddr::from(([0_u16; 8], 443)),
+            transport: quinn::TransportConfig::default(),
+            handshake_timeout: None,
+            max_pending_handshakes: NonZeroUsize::MAX,
         }
     }
 
@@ -48,16 +52,39 @@ impl ServerBuilder {
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        self.congestion_controller = match algorithm {
-            CongestionControl::LowLatency => {
-                Some(Arc::new(quinn::congestion::NewRenoConfig::default()))
-            }
-            CongestionControl::Throughput => {
-                Some(Arc::new(quinn::congestion::BbrConfig::default()))
-            }
-            CongestionControl::Default => None,
+        match algorithm {
+            CongestionControl::LowLatency => self.transport.congestion_controller_factory(
+                Arc::new(quinn::congestion::NewRenoConfig::default()),
+            ),
+            CongestionControl::Throughput => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
+            CongestionControl::Default => self
+                .transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
         };
 
+        self
+    }
+
+    /// Replace the QUIC transport configuration.
+    ///
+    /// Use this to bound receive windows, concurrent streams, datagram buffers,
+    /// idle time, and other per-connection resources.
+    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+        self.transport = transport;
+        self
+    }
+
+    /// Limit the combined QUIC, HTTP/3 SETTINGS, and CONNECT handshake duration.
+    pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
+        self.handshake_timeout = Some(timeout);
+        self
+    }
+
+    /// Limit the number of handshakes retained before accepting another connection.
+    pub fn with_max_pending_handshakes(mut self, limit: NonZeroUsize) -> Self {
+        self.max_pending_handshakes = limit;
         self
     }
 
@@ -74,13 +101,20 @@ impl ServerBuilder {
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // Required ALPN.
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        let config: quinn::crypto::rustls::QuicServerConfig = config
+            .try_into()
+            .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        config.transport_config(Arc::new(self.transport));
 
         let server = quinn::Endpoint::server(config, self.addr)
             .map_err(|e| ServerError::IoError(e.into()))?;
 
-        Ok(Server::new(server))
+        Ok(Server::with_accept_limits(
+            server,
+            self.handshake_timeout,
+            self.max_pending_handshakes,
+        ))
     }
 
     /// Supply certificates for multiple hostnames using SNI.
@@ -102,13 +136,20 @@ impl ServerBuilder {
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()];
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config.try_into().unwrap();
-        let config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        let config: quinn::crypto::rustls::QuicServerConfig = config
+            .try_into()
+            .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
+        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
+        config.transport_config(Arc::new(self.transport));
 
         let server = quinn::Endpoint::server(config, self.addr)
             .map_err(|e| ServerError::IoError(e.into()))?;
 
-        Ok(Server::new(server))
+        Ok(Server::with_accept_limits(
+            server,
+            self.handshake_timeout,
+            self.max_pending_handshakes,
+        ))
     }
 }
 
@@ -116,6 +157,8 @@ impl ServerBuilder {
 pub struct Server {
     endpoint: quinn::Endpoint,
     accept: FuturesUnordered<BoxFuture<'static, Result<Request, ServerError>>>,
+    handshake_timeout: Option<Duration>,
+    max_pending_handshakes: NonZeroUsize,
 }
 
 impl Server {
@@ -126,24 +169,54 @@ impl Server {
         Self {
             endpoint,
             accept: Default::default(),
+            handshake_timeout: None,
+            max_pending_handshakes: NonZeroUsize::MAX,
         }
     }
 
+    fn with_accept_limits(
+        endpoint: quinn::Endpoint,
+        handshake_timeout: Option<Duration>,
+        max_pending_handshakes: NonZeroUsize,
+    ) -> Self {
+        Self {
+            endpoint,
+            accept: Default::default(),
+            handshake_timeout,
+            max_pending_handshakes,
+        }
+    }
+
+    /// Return the local address on which the server endpoint is listening.
+    pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
+        self.endpoint.local_addr()
+    }
+
     /// Accept a new WebTransport session request from a client.
-    pub async fn accept(&mut self) -> Option<Request> {
+    ///
+    /// Returns `None` after the endpoint is closed. Handshake failures are
+    /// returned to the caller instead of being silently discarded.
+    pub async fn accept(&mut self) -> Option<Result<Request, ServerError>> {
         loop {
             tokio::select! {
-                res = self.endpoint.accept() => {
+                res = self.endpoint.accept(), if self.accept.len() < self.max_pending_handshakes.get() => {
                     let conn = res?;
+                    let timeout = self.handshake_timeout;
                     self.accept.push(Box::pin(async move {
-                        let conn = conn.await?;
-                        Request::accept(conn).await
+                        let handshake = async move {
+                            let conn = conn.await?;
+                            Request::accept(conn).await
+                        };
+                        match timeout {
+                            Some(timeout) => tokio::time::timeout(timeout, handshake)
+                                .await
+                                .map_err(|_| ServerError::HandshakeTimeout)?,
+                            None => handshake.await,
+                        }
                     }));
                 }
                 Some(res) = self.accept.next() => {
-                    if let Ok(session) = res {
-                        return Some(session)
-                    }
+                    return Some(res);
                 }
             }
         }
@@ -152,42 +225,119 @@ impl Server {
 
 /// A mostly complete WebTransport handshake awaiting server accept/reject based on URL.
 pub struct Request {
-    conn: quinn::Connection,
-    settings: Settings,
-    connect: Connect,
+    conn: Option<quinn::Connection>,
+    settings: Option<Settings>,
+    connect: Option<Connect>,
+    url: Url,
 }
 
 impl Request {
     /// Accept a new WebTransport session from a client.
     pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
         // Perform the HTTP/3 handshake by sending/receiving SETTINGS frames.
-        let settings = Settings::connect(&conn).await?;
+        let settings = Settings::connect(&conn, false).await?;
 
         // Accept the CONNECT request but defer the response.
         let connect = Connect::accept(&conn).await?;
 
         // Return the request while retaining settings/connect streams.
+        let url = connect.url().clone();
         Ok(Self {
-            conn,
-            settings,
-            connect,
+            conn: Some(conn),
+            settings: Some(settings),
+            connect: Some(connect),
+            url,
         })
     }
 
     /// Return the URL provided by the client.
     pub fn url(&self) -> &Url {
-        self.connect.url()
+        &self.url
     }
 
     /// Accept the session and return a 200 OK response.
     pub async fn ok(mut self) -> Result<Session, ServerError> {
-        self.connect.respond(http::StatusCode::OK).await?;
-        Ok(Session::new(self.conn, self.settings, self.connect))
+        let mut connect = self
+            .connect
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        connect.respond(http::StatusCode::OK).await?;
+        let conn = self
+            .conn
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        let settings = self
+            .settings
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        Ok(Session::new(conn, settings, connect))
     }
 
     /// Reject the session and return the provided HTTP status code.
     pub async fn close(mut self, status: http::StatusCode) -> Result<(), ServerError> {
-        self.connect.respond(status).await?;
+        let mut connect = self
+            .connect
+            .take()
+            .ok_or(ServerError::RequestAlreadyCompleted)?;
+        connect.reject(status).await?;
         Ok(())
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        let Some(mut connect) = self.connect.take() else {
+            return;
+        };
+
+        // Keep the handshake resources alive until the explicit response has
+        // been sent. A dropped request is a server-side failure, not a silent
+        // cancellation, so use 500 rather than making the client wait for EOF.
+        let conn = self.conn.take();
+        let settings = self.settings.take();
+        let url = self.url.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::error!(
+                %url,
+                "dropped unanswered WebTransport request outside a Tokio runtime; \
+                 unable to send the automatic rejection"
+            );
+            return;
+        };
+
+        runtime.spawn(async move {
+            if let Err(error) = connect
+                .reject(http::StatusCode::INTERNAL_SERVER_ERROR)
+                .await
+            {
+                tracing::warn!(
+                    %url,
+                    %error,
+                    "failed to send automatic rejection for dropped WebTransport request"
+                );
+            } else {
+                tracing::warn!(
+                    %url,
+                    status = http::StatusCode::INTERNAL_SERVER_ERROR.as_u16(),
+                    "automatically rejected dropped unanswered WebTransport request"
+                );
+            }
+            drop((conn, settings));
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builder_records_handshake_admission_limits() {
+        let limit = NonZeroUsize::new(17).unwrap();
+        let builder = ServerBuilder::new()
+            .with_handshake_timeout(Duration::from_secs(9))
+            .with_max_pending_handshakes(limit);
+        assert_eq!(builder.handshake_timeout, Some(Duration::from_secs(9)));
+        assert_eq!(builder.max_pending_handshakes, limit);
     }
 }
