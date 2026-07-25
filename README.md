@@ -6,8 +6,7 @@
 
 # webtrans [![Crates.io][crates-badge]][crates-url] ![License][license-badge]
 
-WebTransport for native Rust (QUIC/HTTP/3 through Quinn) and WebAssembly
-(the browser WebTransport API).
+WebTransport for native and WebAssembly.
 
 ## Compatibility
 
@@ -26,11 +25,9 @@ availability can differ by browser and deployment environment.
 
 ## Installation
 
-The workspace MSRV is Rust 1.85.
-
 ```toml
 [dependencies]
-webtrans = "0.4"
+webtrans = "0.5"
 ```
 
 API documentation is available on [docs.rs][doc-url]. Depend directly on
@@ -49,20 +46,20 @@ use std::time::Duration;
 use url::Url;
 use webtrans::ClientBuilder;
 
-# async fn connect() -> Result<(), Box<dyn std::error::Error>> {
-let client = ClientBuilder::new()
-    .with_dns_timeout(Duration::from_secs(5))
-    .with_handshake_timeout(Duration::from_secs(10))
-    .with_system_roots()?;
+async fn connect() -> Result<(), Box<dyn std::error::Error>> {
+    let client = ClientBuilder::new()
+        .with_dns_timeout(Duration::from_secs(5))
+        .with_handshake_timeout(Duration::from_secs(10))
+        .with_system_roots()?;
 
-let session = client
-    .connect(Url::parse("https://example.com/webtransport")?)
-    .await?;
-let (mut send, _recv) = session.open_bi().await?;
-send.write_all(b"hello").await?;
-send.finish()?;
-# Ok(())
-# }
+    let session = client
+        .connect(Url::parse("https://example.com/webtransport")?)
+        .await?;
+    let (mut send, _recv) = session.open_bi().await?;
+    send.write_all(b"hello").await?;
+    send.finish()?;
+    Ok(())
+}
 ```
 
 ## Native server and resource limits
@@ -75,47 +72,47 @@ endpoint-wide limit.
 use std::{num::NonZeroUsize, time::Duration};
 use webtrans::{ServerBuilder, quinn};
 
-# fn build(
-#     chain: Vec<webtrans::quinn::rustls::pki_types::CertificateDer<'static>>,
-#     key: webtrans::quinn::rustls::pki_types::PrivateKeyDer<'static>,
-# ) -> Result<(), Box<dyn std::error::Error>> {
-let mut transport = quinn::quinn::TransportConfig::default();
-transport
-    .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
-    .max_concurrent_bidi_streams(128_u32.into())
-    .max_concurrent_uni_streams(128_u32.into())
-    .stream_receive_window((512_u32 * 1024).into())
-    .receive_window((2_u32 * 1024 * 1024).into())
-    .datagram_receive_buffer_size(Some(1024 * 1024));
+fn build(
+    chain: Vec<webtrans::quinn::rustls::pki_types::CertificateDer<'static>>,
+    key: webtrans::quinn::rustls::pki_types::PrivateKeyDer<'static>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut transport = quinn::quinn::TransportConfig::default();
+    transport
+        .max_idle_timeout(Some(Duration::from_secs(30).try_into()?))
+        .max_concurrent_bidi_streams(128_u32.into())
+        .max_concurrent_uni_streams(128_u32.into())
+        .stream_receive_window((512_u32 * 1024).into())
+        .receive_window((2_u32 * 1024 * 1024).into())
+        .datagram_receive_buffer_size(Some(1024 * 1024));
 
-let mut server = ServerBuilder::new()
-    .with_transport_config(transport)
-    .with_handshake_timeout(Duration::from_secs(10))
-    .with_max_pending_handshakes(NonZeroUsize::new(256).unwrap())
-    .with_certificate(chain, key)?;
+    let mut server = ServerBuilder::new()
+        .with_transport_config(transport)
+        .with_handshake_timeout(Duration::from_secs(10))
+        .with_max_pending_handshakes(NonZeroUsize::new(256).unwrap())
+        .with_certificate(chain, key)?;
 
-# async move {
-while let Some(result) = server.accept().await {
-    let request = match result {
-        Ok(request) => request,
-        Err(error) => {
-            eprintln!("handshake failed: {error}");
-            continue;
+    async move {
+        while let Some(result) = server.accept().await {
+            let request = match result {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!("handshake failed: {error}");
+                    continue;
+                }
+            };
+            tokio::spawn(async move {
+                if request.url().path() == "/webtransport" {
+                    let _session = request.ok().await;
+                } else {
+                    let _ = request
+                        .close(webtrans::quinn::http::StatusCode::NOT_FOUND)
+                        .await;
+                }
+            });
         }
     };
-    tokio::spawn(async move {
-        if request.url().path() == "/webtransport" {
-            let _session = request.ok().await;
-        } else {
-            let _ = request
-                .close(webtrans::quinn::http::StatusCode::NOT_FOUND)
-                .await;
-        }
-    });
+    Ok(())
 }
-# };
-# Ok(())
-# }
 ```
 
 Every accepted `Request` must be completed with `Request::ok` or
@@ -156,15 +153,6 @@ cargo build --target wasm32-unknown-unknown -p webtrans -p webtrans-wasm
 - `webtrans-wasm`: browser bindings.
 - `webtrans-wasm-demo`: browser demo.
 
-## Versioning and support
-
-The crates follow Semantic Versioning as a coordinated workspace. Before 1.0,
-a minor release may contain public API changes; patch releases remain
-backward-compatible unless a security or soundness issue requires otherwise.
-The MSRV may increase in a minor release and is recorded in `Cargo.toml` and
-the changelog. Supported versions and vulnerability reporting are documented
-in [SECURITY.md](SECURITY.md).
-
 ## Benchmarking
 
 Criterion benchmarks are available for `webtrans-proto`:
@@ -172,23 +160,3 @@ Criterion benchmarks are available for `webtrans-proto`:
 ```bash
 cargo bench -p webtrans-proto
 ```
-
-## Fuzzing and interoperability
-
-Decoder fuzz targets and their seeded corpora are in `fuzz/`:
-
-```bash
-cargo check --manifest-path fuzz/Cargo.toml --all-targets
-cd fuzz
-cargo fuzz run varint
-```
-
-The independent native interoperability suite uses `wtransport`:
-
-```bash
-cargo test --manifest-path interop/Cargo.toml
-```
-
-The dedicated interoperability workflow additionally installs the current
-Playwright Chromium build and covers bidirectional and unidirectional streams,
-datagrams, close codes and reasons, rejected requests, and reconnects.
