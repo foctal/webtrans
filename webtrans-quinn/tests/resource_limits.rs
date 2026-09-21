@@ -193,9 +193,9 @@ fn make_raw_client_with_transport(
     for cert in certs {
         roots.add(cert).unwrap();
     }
-    let mut tls = webtrans_quinn::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
-        rustls::crypto::ring::default_provider(),
-    ))
+    let mut tls = webtrans_quinn::rustls::ClientConfig::builder_with_provider(
+        webtrans_quinn::crypto::default_provider(),
+    )
     .with_safe_default_protocol_versions()
     .expect("protocol versions")
     .with_root_certificates(roots)
