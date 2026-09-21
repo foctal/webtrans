@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use futures::stream::{FuturesUnordered, Stream, StreamExt};
 use url::Url;
 
@@ -83,7 +83,7 @@ pub struct Session {
 
     // Local close requests are serialized through the CONNECT stream task so
     // the peer receives a CLOSE_WEBTRANSPORT_SESSION capsule before QUIC closes.
-    close_tx: Option<tokio::sync::mpsc::UnboundedSender<CloseCommand>>,
+    close_tx: Option<tokio::sync::mpsc::Sender<CloseCommand>>,
 }
 
 impl Session {
@@ -105,7 +105,7 @@ impl Session {
 
         // Accept logic is stateful, so use an Arc<Mutex> to share it.
         let accept = SessionAccept::new(conn.clone(), session_id);
-        let (close_tx, close_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (close_tx, close_rx) = tokio::sync::mpsc::channel(1);
         let settings = Arc::new(settings);
 
         let this = Self {
@@ -167,39 +167,54 @@ impl Session {
     // Keep reading from the control stream until it closes.
     async fn run_closed(
         connect: Connect,
-        mut close_rx: tokio::sync::mpsc::UnboundedReceiver<CloseCommand>,
+        mut close_rx: tokio::sync::mpsc::Receiver<CloseCommand>,
     ) -> Result<Option<(u32, String)>, webtrans_proto::CapsuleError> {
         let (mut send, mut recv) = connect.into_inner();
+        let mut pending_capsules = BytesMut::new();
 
         loop {
             tokio::select! {
-                capsule = Self::read_capsule_frame(&mut recv) => match capsule {
+                capsule = Self::read_capsule_frame(&mut recv, &mut pending_capsules) => match capsule {
                     Ok(Capsule::CloseWebTransportSession { code, reason }) => {
                         return Ok(Some((code, reason)));
                     }
-                    Ok(Capsule::Unknown { typ, payload }) => {
-                        tracing::warn!("unknown capsule: type={typ} size={}", payload.len());
-                    }
+                    // RFC 9297 requires endpoints to silently ignore unknown
+                    // capsule types, including reserved GREASE values.
+                    Ok(Capsule::Unknown { .. }) => {}
                     Err(e) if is_graceful_close(&e) => return Ok(None),
                     Err(e) => return Err(e),
                 },
-                Some(close) = close_rx.recv() => {
+                close = close_rx.recv() => {
+                    let Some(close) = close else {
+                        return Ok(Some((0, "last session handle dropped".to_owned())));
+                    };
                     let reason = Self::capsule_reason(&close.reason);
                     let capsule = Capsule::CloseWebTransportSession {
                         code: close.code,
                         reason,
                     };
-                    Self::write_capsule_frame(&mut send, &capsule).await?;
-                    let _ = send.finish();
-                    let _ = send.stopped().await;
-                    return Ok(None);
+                    // The deadline includes capsule submission: a peer can
+                    // exhaust CONNECT stream credit before reading our close.
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        Self::write_capsule_frame(&mut send, &capsule).await?;
+                        let _ = send.finish();
+                        let _ = send.stopped().await;
+                        Ok::<(), CapsuleError>(())
+                    }).await;
+                    return Ok(Some((close.code, Self::capsule_reason(&close.reason))));
                 }
             }
         }
     }
 
-    async fn read_capsule_frame(recv: &mut quinn::RecvStream) -> Result<Capsule, CapsuleError> {
+    async fn read_capsule_frame(
+        recv: &mut quinn::RecvStream,
+        pending: &mut BytesMut,
+    ) -> Result<Capsule, CapsuleError> {
         loop {
+            if let Some(capsule) = Self::decode_buffered_capsule(pending)? {
+                return Ok(capsule);
+            }
             let typ = VarInt::read(recv)
                 .await
                 .map_err(|_| CapsuleError::UnexpectedEnd)?;
@@ -222,8 +237,36 @@ impl Session {
                 tracing::warn!("ignoring non-DATA frame on CONNECT stream: {typ:?}");
                 continue;
             }
-            return Capsule::decode(&mut payload.as_slice());
+            // DATA frame boundaries are not capsule boundaries. Retain a
+            // partial capsule and any following capsules for the next call.
+            // A partial capsule is at most 1,044 bytes; one additional DATA
+            // frame is bounded by MAX_CAPSULE_FRAME_SIZE above.
+            pending.extend_from_slice(&payload);
         }
+    }
+
+    fn decode_buffered_capsule(pending: &mut BytesMut) -> Result<Option<Capsule>, CapsuleError> {
+        let mut cursor = Cursor::new(pending.as_ref());
+        if VarInt::decode(&mut cursor).is_err() {
+            return Ok(None);
+        }
+        let Ok(length) = VarInt::decode(&mut cursor) else {
+            return Ok(None);
+        };
+        let length =
+            usize::try_from(length.into_inner()).map_err(|_| CapsuleError::MessageTooLong)?;
+        // Match the capsule codec's existing 4-byte code + 1,024-byte payload
+        // policy before allocating or waiting for any attacker-chosen length.
+        if length > 1028 {
+            return Err(CapsuleError::MessageTooLong);
+        }
+        let total = cursor.position() as usize + length;
+        if pending.len() < total {
+            return Ok(None);
+        }
+        let capsule = Capsule::decode(&mut &pending[..total])?;
+        pending.advance(total);
+        Ok(Some(capsule))
     }
 
     async fn write_capsule_frame(
@@ -400,16 +443,20 @@ impl Session {
     ///
     /// WebTransport sessions first send a CLOSE_WEBTRANSPORT_SESSION capsule
     /// from the background CONNECT task. Raw QUIC sessions close immediately.
+    /// Close requests use a one-entry queue and a reason capped at 1024 bytes.
+    /// Waiting for the peer to acknowledge FIN is bounded to five seconds.
     pub fn close(&self, code: u32, reason: &[u8]) {
-        if let Some(close_tx) = &self.close_tx
-            && close_tx
-                .send(CloseCommand {
-                    code,
-                    reason: reason.to_vec(),
-                })
-                .is_ok()
-        {
-            return;
+        if let Some(close_tx) = &self.close_tx {
+            // At most one bounded close request can be queued. Repeated closes
+            // must not retain arbitrary caller-controlled reason buffers.
+            let reason = Self::capsule_reason(&reason[..reason.len().min(1024)]);
+            match close_tx.try_send(CloseCommand {
+                code,
+                reason: reason.into_bytes(),
+            }) {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+            }
         }
 
         if self.session_id.is_some() {

@@ -23,7 +23,7 @@ webtrans-wasm = { workspace = true }
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["logging", "std"] }
 tokio = { version = "1", features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"

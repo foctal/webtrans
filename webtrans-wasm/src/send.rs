@@ -39,40 +39,47 @@ impl SendStream {
 
     /// Write all of the provided bytes to the stream.
     pub async fn write(&mut self, buf: &[u8]) -> Result<(), Error> {
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| Error::Unknown("writer is unavailable".into()))?;
-        writer
-            .write(&Uint8Array::from(buf))
+        use futures::io::AsyncWriteExt;
+        self.write_all(buf)
             .await
-            .map_err(Into::into)
+            .map_err(|error| Error::Unknown(error.to_string().into()))?;
+        self.flush()
+            .await
+            .map_err(|error| Error::Unknown(error.to_string().into()))
     }
 
     /// Write some of the provided buffer to the stream.
+    /// Cancelling preserves accepted bytes; flush before finishing the stream.
     pub async fn write_buf<B: Buf>(&mut self, buf: &mut B) -> Result<usize, Error> {
-        let chunk = buf.chunk();
-        let size = chunk.len();
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| Error::Unknown("writer is unavailable".into()))?;
-        writer.write(&Uint8Array::from(chunk)).await?;
+        let size = futures::io::AsyncWriteExt::write(self, buf.chunk())
+            .await
+            .map_err(|error| Error::Unknown(error.to_string().into()))?;
         buf.advance(size);
         Ok(size)
     }
 
     /// Send an immediate reset, closing the stream with an error.
     pub fn reset(&mut self, reason: &str) {
+        self.is_closed = true;
+        self.write_state = WriteState::Idle;
         if let Some(writer) = self.writer.as_mut() {
             writer.abort(reason);
+        } else {
+            let abort = self.stream.abort_with_reason(&reason.into());
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = wasm_bindgen_futures::JsFuture::from(abort).await;
+            });
         }
     }
 
     /// Mark the stream as finished.
     ///
-    /// This is called on drop, but can also be invoked manually.
+    /// Flush accepted writes first, or use `AsyncWriteExt::close` to drain them.
+    /// A synchronous finish rejects a pending write instead of silently losing it.
     pub fn finish(&mut self) -> Result<(), Error> {
+        if matches!(self.write_state, WriteState::Writing(_)) {
+            return Err(Error::Unknown("flush pending writes before finish".into()));
+        }
         if let Some(writer) = self.writer.as_mut() {
             writer.close();
         }
@@ -102,10 +109,10 @@ impl SendStream {
         };
 
         // If this is a WebTransportError, extract the error code when available.
-        if let Error::Stream(err) = &err {
-            if let Some(code) = err.stream_error_code() {
-                return Ok(Some(code));
-            }
+        if let Error::Stream(err) = &err
+            && let Some(code) = err.stream_error_code()
+        {
+            return Ok(Some(code));
         }
 
         Err(err)
@@ -113,8 +120,12 @@ impl SendStream {
 }
 
 impl Drop for SendStream {
-    /// Close the stream with a FIN.
+    /// Close an idle stream, or abort a dropped buffered write.
     fn drop(&mut self) {
+        if matches!(self.write_state, WriteState::Writing(_)) {
+            self.reset("dropped with pending write");
+            return;
+        }
         if let Some(writer) = self.writer.as_mut() {
             writer.close();
         }
@@ -162,40 +173,57 @@ impl AsyncWrite for SendStream {
             )));
         }
 
+        match self.poll_inflight_write(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Err(error)) => {
+                self.is_closed = true;
+                return Poll::Ready(Err(error));
+            }
+            Poll::Ready(Ok(_)) => {}
+        }
         if matches!(self.write_state, WriteState::Idle) {
             let mut writer = match self.writer.take() {
                 Some(writer) => writer,
                 None => return Poll::Ready(Err(Self::error_unavailable())),
             };
 
-            let payload = Vec::from(buf);
-            let size = payload.len();
+            let payload = Uint8Array::from(&buf[..buf.len().min(64 * 1024)]);
+            let size = payload.length() as usize;
             let fut = Box::pin(async move {
                 let result = writer
-                    .write(&Uint8Array::from(payload.as_slice()))
+                    .write(&payload)
                     .await
                     .map(|_| size)
                     .map_err(|err| Self::to_io_error(err.into()));
                 (writer, result)
             });
             self.write_state = WriteState::Writing(fut);
+            // The owned chunk is now accepted. A later call may use a different
+            // buffer after cancellation, and must never receive this length.
+            return Poll::Ready(Ok(size));
         }
 
-        self.poll_inflight_write(cx)
+        unreachable!("inflight write was drained")
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.poll_inflight_write(cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(Ok(_)) => Poll::Ready(Ok(())),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                self.is_closed = true;
+                Poll::Ready(Err(err))
+            }
         }
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.as_mut().poll_flush(cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                self.is_closed = true;
+                Poll::Ready(Err(err))
+            }
             Poll::Ready(Ok(())) => {
                 if !self.is_closed {
                     let writer = match self.writer.as_mut() {
@@ -239,5 +267,54 @@ impl webtrans_trait::SendStream for SendStream {
             )),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use futures::{io::AsyncWriteExt, poll};
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen(inline_js = "
+        export function controlledWriter() {
+            let release;
+            const gate = new Promise(resolve => { release = resolve; });
+            const chunks = [];
+            const stream = new WritableStream({write(chunk) {
+                chunks.push(Array.from(chunk));
+                return chunks.length === 1 ? gate : Promise.resolve();
+            }});
+            stream.release = release;
+            stream.chunks = chunks;
+            return stream;
+        }
+        export function releaseWriter(stream) { stream.release(); }
+        export function writtenBytes(stream) { return new Uint8Array(stream.chunks.flat()); }
+    ")]
+    extern "C" {
+        fn controlledWriter() -> web_sys::WritableStream;
+        fn releaseWriter(stream: &web_sys::WritableStream);
+        fn writtenBytes(stream: &web_sys::WritableStream) -> Uint8Array;
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn buffered_write_reports_acceptance_before_waiting_for_js() {
+        let raw = controlledWriter();
+        let mut stream = SendStream::new(raw.clone().unchecked_into()).unwrap();
+        let mut first = Box::pin(AsyncWriteExt::write(&mut stream, b"first"));
+        assert!(matches!(poll!(first.as_mut()), Poll::Ready(Ok(5))));
+        drop(first);
+        {
+            let mut next = Box::pin(AsyncWriteExt::write(&mut stream, b"discarded"));
+            assert!(poll!(next.as_mut()).is_pending());
+        }
+        assert!(stream.finish().is_err());
+        releaseWriter(&raw);
+        assert_eq!(AsyncWriteExt::write(&mut stream, b"x").await.unwrap(), 1);
+        stream.flush().await.unwrap();
+        assert_eq!(writtenBytes(&raw).to_vec(), b"firstx");
+        AsyncWriteExt::close(&mut stream).await.unwrap();
     }
 }

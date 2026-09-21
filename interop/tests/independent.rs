@@ -160,7 +160,8 @@ async fn send_malformed_settings(
     for cert in certs {
         roots.add(cert)?;
     }
-    let mut tls = webtrans_quinn::rustls::ClientConfig::builder()
+    let mut tls = webtrans_quinn::rustls::ClientConfig::builder_with_provider(webtrans_quinn::crypto::default_provider())
+            .with_safe_default_protocol_versions().expect("protocol versions")
         .with_root_certificates(roots)
         .with_no_client_auth();
     tls.alpn_protocols = vec![webtrans_quinn::ALPN.as_bytes().to_vec()];

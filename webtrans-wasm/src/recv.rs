@@ -23,6 +23,8 @@ enum ReadState {
 ///
 /// Either side may close with an error code, or the peer may close with a FIN.
 pub struct RecvStream {
+    stream: WebTransportReceiveStream,
+    eof: bool,
     reader: Option<Reader<Uint8Array>>,
     buffer: Bytes,
     read_state: ReadState,
@@ -33,6 +35,8 @@ impl RecvStream {
         let reader = Reader::new(&stream)?;
 
         Ok(Self {
+            stream,
+            eof: false,
             reader: Some(reader),
             buffer: Bytes::new(),
             read_state: ReadState::Idle,
@@ -42,29 +46,12 @@ impl RecvStream {
     /// Read the next chunk of data with the provided maximum size.
     ///
     /// This returns a chunk of data instead of copying, which can be more efficient.
+    /// Cancellation retains the pending JS read for the next caller. A zero
+    /// maximum returns an empty chunk without consuming input.
     pub async fn read(&mut self, max: usize) -> Result<Option<Bytes>, Error> {
-        if !self.buffer.is_empty() {
-            let size = cmp::min(max, self.buffer.len());
-            let data = self.buffer.split_to(size);
-            return Ok(Some(data));
-        }
-
-        let reader = self
-            .reader
-            .as_mut()
-            .ok_or_else(|| Error::Unknown("reader is unavailable".into()))?;
-
-        let mut data: Bytes = match reader.read().await? {
-            Some(data) => Bytes::from(data.to_vec()),
-            None => return Ok(None),
-        };
-
-        if data.len() > max {
-            // The chunk is too large; buffer the remainder for the next read.
-            self.buffer = data.split_off(max);
-        }
-
-        Ok(Some(data))
+        std::future::poll_fn(|cx| self.poll_chunk(cx, max))
+            .await
+            .map_err(|error| Error::Unknown(error.to_string().into()))
     }
 
     /// Read some data into the provided buffer.
@@ -85,8 +72,16 @@ impl RecvStream {
 
     /// Abort reading from the stream with the given reason.
     pub fn stop(&mut self, reason: &str) {
+        self.eof = true;
+        self.buffer = Bytes::new();
+        self.read_state = ReadState::Idle;
         if let Some(reader) = self.reader.as_mut() {
             reader.abort(reason);
+        } else {
+            let cancel = self.stream.cancel_with_reason(&reason.into());
+            wasm_bindgen_futures::spawn_local(async move {
+                let _ = wasm_bindgen_futures::JsFuture::from(cancel).await;
+            });
         }
     }
 
@@ -103,10 +98,10 @@ impl RecvStream {
         };
 
         // If this is a WebTransportError, extract the error code when available.
-        if let Error::Stream(err) = &err {
-            if let Some(code) = err.stream_error_code() {
-                return Ok(Some(code));
-            }
+        if let Error::Stream(err) = &err
+            && let Some(code) = err.stream_error_code()
+        {
+            return Ok(Some(code));
         }
 
         Err(err)
@@ -115,9 +110,7 @@ impl RecvStream {
 
 impl Drop for RecvStream {
     fn drop(&mut self) {
-        if let Some(reader) = self.reader.as_mut() {
-            reader.abort("dropped");
-        }
+        self.stop("dropped");
     }
 }
 
@@ -145,47 +138,65 @@ impl RecvStream {
     }
 }
 
-impl AsyncRead for RecvStream {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<io::Result<usize>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(0));
+impl RecvStream {
+    fn poll_chunk(&mut self, cx: &mut Context<'_>, max: usize) -> Poll<io::Result<Option<Bytes>>> {
+        if max == 0 {
+            return Poll::Ready(Ok(Some(Bytes::new())));
         }
-
-        loop {
+        // Bound work per poll if a JS source produces empty chunks repeatedly.
+        for _ in 0..16 {
             if !self.buffer.is_empty() {
-                let size = cmp::min(buf.len(), self.buffer.len());
-                buf[..size].copy_from_slice(&self.buffer.split_to(size));
-                return Poll::Ready(Ok(size));
+                let size = cmp::min(max, self.buffer.len());
+                return Poll::Ready(Ok(Some(self.buffer.split_to(size))));
             }
-
+            if self.eof {
+                return Poll::Ready(Ok(None));
+            }
             if matches!(self.read_state, ReadState::Idle) {
                 let mut reader = match self.reader.take() {
                     Some(reader) => reader,
                     None => return Poll::Ready(Err(Self::error_unavailable())),
                 };
-
-                let fut = Box::pin(async move {
+                self.read_state = ReadState::Reading(Box::pin(async move {
                     let result = reader
                         .read()
                         .await
                         .map(|data| data.map(|value| Bytes::from(value.to_vec())))
                         .map_err(|err| Self::to_io_error(err.into()));
                     (reader, result)
-                });
-                self.read_state = ReadState::Reading(fut);
+                }));
             }
-
             match self.poll_inflight_read(cx) {
                 Poll::Pending => return Poll::Pending,
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
-                Poll::Ready(Ok(None)) => return Poll::Ready(Ok(0)),
-                Poll::Ready(Ok(Some(chunk))) => {
-                    self.buffer = chunk;
+                Poll::Ready(Err(err)) => {
+                    self.eof = true;
+                    return Poll::Ready(Err(err));
                 }
+                Poll::Ready(Ok(None)) => {
+                    self.eof = true;
+                    return Poll::Ready(Ok(None));
+                }
+                Poll::Ready(Ok(Some(chunk))) => self.buffer = chunk,
+            }
+        }
+        cx.waker().wake_by_ref();
+        Poll::Pending
+    }
+}
+
+impl AsyncRead for RecvStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        match self.poll_chunk(cx, buf.len()) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+            Poll::Ready(Ok(None)) => Poll::Ready(Ok(0)),
+            Poll::Ready(Ok(Some(chunk))) => {
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Poll::Ready(Ok(chunk.len()))
             }
         }
     }
@@ -218,5 +229,51 @@ impl webtrans_trait::RecvStream for RecvStream {
             )),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod tests {
+    use super::*;
+    use futures::{io::AsyncReadExt, poll};
+    use wasm_bindgen::prelude::*;
+    use wasm_bindgen_test::*;
+
+    #[wasm_bindgen(inline_js = "
+        export function controlledReader() {
+            let controller;
+            const stream = new ReadableStream({start(c) { controller = c; }});
+            stream.controller = controller;
+            return stream;
+        }
+        export function deliver(stream) {
+            stream.controller.enqueue(new Uint8Array([1,2,3,4]));
+            stream.controller.close();
+        }
+    ")]
+    extern "C" {
+        fn controlledReader() -> web_sys::ReadableStream;
+        fn deliver(stream: &web_sys::ReadableStream);
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn cancelled_read_can_resume_through_either_api() {
+        let raw = controlledReader();
+        let mut stream = RecvStream::new(raw.clone().unchecked_into()).unwrap();
+        assert_eq!(stream.read(0).await.unwrap().unwrap().len(), 0);
+        {
+            let mut pending = Box::pin(stream.read(2));
+            assert!(poll!(pending.as_mut()).is_pending());
+        }
+        deliver(&raw);
+        let mut first = [0; 1];
+        AsyncReadExt::read_exact(&mut stream, &mut first)
+            .await
+            .unwrap();
+        assert_eq!(first, [1]);
+        assert_eq!(stream.read(2).await.unwrap().unwrap().as_ref(), &[2, 3]);
+        assert_eq!(stream.read(2).await.unwrap().unwrap().as_ref(), &[4]);
+        assert!(stream.read(2).await.unwrap().is_none());
+        assert!(stream.read(2).await.unwrap().is_none());
     }
 }

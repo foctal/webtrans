@@ -140,7 +140,9 @@ impl TlsServerConfigBuilder {
     /// Build a server TLS config using an ephemeral self-signed certificate.
     pub fn new_insecure(subject_alt_names: Vec<String>) -> Result<Self> {
         let (certs, key) = generate_self_signed_pair_der(subject_alt_names)?;
-        let inner = ServerConfig::builder()
+        let inner = ServerConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Tls(e.to_string()))?
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| Error::Tls(e.to_string()))?;
@@ -150,7 +152,9 @@ impl TlsServerConfigBuilder {
     /// Build a server TLS config from certificate and private key files.
     pub fn new_with_cert(cert_path: &Path, key_path: &Path) -> Result<Self> {
         let (certs, key) = load_cert(cert_path, key_path)?;
-        let inner = ServerConfig::builder()
+        let inner = ServerConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Tls(e.to_string()))?
             .with_no_client_auth()
             .with_single_cert(certs, key)
             .map_err(|e| Error::Tls(e.to_string()))?;
@@ -183,7 +187,9 @@ pub struct TlsClientConfigBuilder {
 impl TlsClientConfigBuilder {
     /// Build a client TLS config that disables certificate verification.
     pub fn new_insecure() -> Result<Self> {
-        let inner = ClientConfig::builder()
+        let inner = ClientConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Tls(e.to_string()))?
             .dangerous()
             .with_custom_certificate_verifier(SkipServerVerification::new())
             .with_no_client_auth();
@@ -193,7 +199,9 @@ impl TlsClientConfigBuilder {
     /// Build a client TLS config from native system trust roots.
     pub fn new_with_native_certs() -> Result<Self> {
         let native_certs = cert::get_native_certs()?;
-        let inner = ClientConfig::builder()
+        let inner = ClientConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Tls(e.to_string()))?
             .with_root_certificates(native_certs)
             .with_no_client_auth();
         Ok(Self { inner })
@@ -201,7 +209,9 @@ impl TlsClientConfigBuilder {
 
     /// Build a client TLS config with a custom WebPKI verifier.
     pub fn new_with_webpki_verifier(verifier: Arc<WebPkiServerVerifier>) -> Result<Self> {
-        let inner = ClientConfig::builder()
+        let inner = ClientConfig::builder_with_provider(crate::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| Error::Tls(e.to_string()))?
             .with_webpki_verifier(verifier)
             .with_no_client_auth();
         Ok(Self { inner })
@@ -226,9 +236,12 @@ mod tests {
     #[test]
     fn test_generate_self_signed_pair_der() {
         let (cert_chain, key) = generate_self_signed_pair_der(vec!["localhost".into()]).unwrap();
-        let rustls_server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key);
+        let rustls_server_config =
+            ServerConfig::builder_with_provider(crate::crypto::default_provider())
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key);
 
         if let Err(e) = rustls_server_config {
             panic!("Failed to create ServerConfig: {e}");
@@ -239,15 +252,19 @@ mod tests {
     fn test_generate_self_signed_pair_pem() {
         let (cert_chain, key) = generate_self_signed_pair_pem(vec!["localhost".into()]).unwrap();
 
-        let cert_path = Path::new("cert.pem");
-        let key_path = Path::new("key.pem");
+        let directory = tempfile::tempdir().expect("isolated certificate directory");
+        let cert_path = &directory.path().join("cert.pem");
+        let key_path = &directory.path().join("key.pem");
         std::fs::write(cert_path, cert_chain.join("\n")).unwrap();
         std::fs::write(key_path, key).unwrap();
 
         let (cert_chain, key) = load_cert(cert_path, key_path).unwrap();
-        let rustls_server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(cert_chain, key);
+        let rustls_server_config =
+            ServerConfig::builder_with_provider(crate::crypto::default_provider())
+                .with_safe_default_protocol_versions()
+                .expect("protocol versions")
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, key);
 
         if let Err(e) = rustls_server_config {
             panic!("Failed to create ServerConfig: {e}");

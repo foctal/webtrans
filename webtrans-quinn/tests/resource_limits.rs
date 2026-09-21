@@ -182,19 +182,182 @@ async fn dropping_request_sends_an_observable_http_rejection() {
 fn make_raw_client(
     certs: Vec<webtrans_quinn::rustls::pki_types::CertificateDer<'static>>,
 ) -> quinn::Endpoint {
+    make_raw_client_with_transport(certs, quinn::TransportConfig::default())
+}
+
+fn make_raw_client_with_transport(
+    certs: Vec<webtrans_quinn::rustls::pki_types::CertificateDer<'static>>,
+    transport: quinn::TransportConfig,
+) -> quinn::Endpoint {
     let mut roots = webtrans_quinn::rustls::RootCertStore::empty();
     for cert in certs {
         roots.add(cert).unwrap();
     }
-    let mut tls = webtrans_quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+    let mut tls = webtrans_quinn::rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
     tls.alpn_protocols = vec![webtrans_quinn::ALPN.as_bytes().to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap();
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
-    config.transport_config(Arc::new(quinn::TransportConfig::default()));
+    config.transport_config(Arc::new(transport));
 
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
     endpoint.set_default_client_config(config);
     endpoint
+}
+
+#[tokio::test]
+async fn dropping_last_session_closes_the_peer_without_waiting_for_idle_timeout() {
+    let (client, server) = connect_pair(quinn::TransportConfig::default())
+        .await
+        .unwrap();
+    drop(client);
+    tokio::time::timeout(TEST_TIMEOUT, server.closed())
+        .await
+        .expect("dropping the final session must release the CONNECT task");
+}
+
+#[tokio::test]
+async fn repeated_close_requests_complete_with_bounded_queueing() {
+    let (client, server) = connect_pair(quinn::TransportConfig::default())
+        .await
+        .unwrap();
+    let reason = vec![b'x'; 16 * 1024];
+    // No await: a current-thread runtime cannot drain the close queue here.
+    for _ in 0..1024 {
+        client.close(42, &reason);
+    }
+    tokio::time::timeout(TEST_TIMEOUT, server.closed())
+        .await
+        .expect("repeated close must still reach the peer");
+}
+
+#[tokio::test]
+async fn close_deadline_includes_a_credit_blocked_capsule_write() {
+    let (chain, key) = generate_self_signed_pair_der(vec!["localhost".to_owned()]).unwrap();
+    let mut server = ServerBuilder::new()
+        .with_addr("127.0.0.1:0".parse().unwrap())
+        .with_certificate(chain.clone(), key)
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    let mut transport = quinn::TransportConfig::default();
+    transport.stream_receive_window(VarInt::from_u32(128));
+    let endpoint = make_raw_client_with_transport(chain, transport);
+    let server_task =
+        tokio::spawn(async move { server.accept().await.unwrap().unwrap().ok().await.unwrap() });
+    let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+    let mut control = conn.open_uni().await.unwrap();
+    let mut settings = webtrans_proto::Settings::default();
+    settings.enable_webtransport(1);
+    settings.write(&mut control).await.unwrap();
+    let mut peer_control = conn.accept_uni().await.unwrap();
+    webtrans_proto::Settings::read(&mut peer_control)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+    webtrans_proto::ConnectRequest {
+        url: Url::parse(&format!("https://localhost:{}/blocked-close", addr.port())).unwrap(),
+    }
+    .write(&mut send)
+    .await
+    .unwrap();
+    webtrans_proto::ConnectResponse::read(&mut recv)
+        .await
+        .unwrap();
+    let session = server_task.await.unwrap();
+    // Keep the CONNECT receive stream alive without reading its close capsule.
+    // The capsule exceeds the remaining stream credit and cannot finish writing.
+    session.close(42, &[b'x'; 1024]);
+    let error = tokio::time::timeout(Duration::from_secs(7), conn.closed())
+        .await
+        .expect("the close deadline must include capsule submission");
+    match error {
+        quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+            close.error_code.into_inner(),
+            webtrans_proto::error_to_http3(42)
+        ),
+        other => panic!("unexpected shutdown: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn capsule_stream_survives_grease_fragmentation_and_coalescing() {
+    for chunk_size in [usize::MAX, 1, 5] {
+        let (chain, key) = generate_self_signed_pair_der(vec!["localhost".to_owned()]).unwrap();
+        let mut server = ServerBuilder::new()
+            .with_addr("127.0.0.1:0".parse().unwrap())
+            .with_certificate(chain.clone(), key)
+            .unwrap();
+        let addr = server.local_addr().unwrap();
+        let endpoint = make_raw_client(chain);
+        let server_task =
+            tokio::spawn(
+                async move { server.accept().await.unwrap().unwrap().ok().await.unwrap() },
+            );
+        let conn = endpoint.connect(addr, "localhost").unwrap().await.unwrap();
+        let mut control = conn.open_uni().await.unwrap();
+        let mut settings = webtrans_proto::Settings::default();
+        settings.enable_webtransport(1);
+        settings.write(&mut control).await.unwrap();
+        let mut peer_control = conn.accept_uni().await.unwrap();
+        webtrans_proto::Settings::read(&mut peer_control)
+            .await
+            .unwrap();
+        let (mut send, mut recv) = conn.open_bi().await.unwrap();
+        webtrans_proto::ConnectRequest {
+            url: Url::parse(&format!("https://localhost:{}/capsules", addr.port())).unwrap(),
+        }
+        .write(&mut send)
+        .await
+        .unwrap();
+        webtrans_proto::ConnectResponse::read(&mut recv)
+            .await
+            .unwrap();
+        let _session = server_task.await.unwrap();
+        let mut capsules = Vec::new();
+        // 0x21 was incorrectly treated as HTTP/3 GREASE by the capsule decoder.
+        for typ in [0x21, 0x17] {
+            webtrans_proto::Capsule::Unknown {
+                typ: webtrans_proto::VarInt::from_u32(typ),
+                payload: Bytes::from_static(&[0xff, 0xff, 0xff]),
+            }
+            .encode(&mut capsules)
+            .unwrap();
+        }
+        webtrans_proto::Capsule::CloseWebTransportSession {
+            code: 42,
+            reason: "complete".into(),
+        }
+        .encode(&mut capsules)
+        .unwrap();
+        for chunk in capsules.chunks(chunk_size) {
+            let mut frame = Vec::new();
+            // Empty DATA and HTTP/3 GREASE do not delimit or terminate capsules.
+            webtrans_proto::Frame::DATA.encode(&mut frame);
+            webtrans_proto::VarInt::from_u32(0).encode(&mut frame);
+            webtrans_proto::Frame::from_u32(0x21).encode(&mut frame);
+            webtrans_proto::VarInt::from_u32(3).encode(&mut frame);
+            frame.extend_from_slice(&[0xff; 3]);
+            webtrans_proto::Frame::DATA.encode(&mut frame);
+            webtrans_proto::VarInt::try_from(chunk.len())
+                .unwrap()
+                .encode(&mut frame);
+            frame.extend_from_slice(chunk);
+            send.write_all(&frame).await.unwrap();
+        }
+        let error = tokio::time::timeout(TEST_TIMEOUT, conn.closed())
+            .await
+            .unwrap();
+        match error {
+            quinn::ConnectionError::ApplicationClosed(close) => assert_eq!(
+                close.error_code.into_inner(),
+                webtrans_proto::error_to_http3(42)
+            ),
+            other => panic!("unexpected capsule shutdown: {other:?}"),
+        }
+    }
 }

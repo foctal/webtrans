@@ -15,18 +15,19 @@ pub type Provider = Arc<CryptoProvider>;
 /// Return the default crypto provider.
 ///
 /// This function checks for a process-wide default provider first,
-/// then falls back to feature-enabled providers (ring or aws-lc-rs).
+/// then falls back to ring when enabled, otherwise aws-lc-rs. Enabling
+/// both features is supported and does not change the process-wide default.
 ///
 /// # Panics
 ///
-/// Panics if no provider is available. Either call `CryptoProvider::set_default()`
-/// or enable exactly one of the `ring` or `aws-lc-rs` features.
+/// Panics if no provider is available. Either call `CryptoProvider::install_default()`
+/// or enable at least one of the `ring` or `aws-lc-rs` features.
 pub fn default_provider() -> Provider {
     // See <https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#using-the-per-process-default-cryptoprovider>
     if let Some(provider) = CryptoProvider::get_default().cloned() {
         return provider;
     }
-    #[cfg(all(feature = "ring", not(feature = "aws-lc-rs")))]
+    #[cfg(feature = "ring")]
     {
         return Arc::new(rustls::crypto::ring::default_provider());
     }
@@ -38,7 +39,7 @@ pub fn default_provider() -> Provider {
     #[allow(unreachable_code)]
     {
         panic!(
-            "CryptoProvider::set_default() must be called; or only enable one ring/aws-lc-rs feature."
+            "CryptoProvider::install_default() must be called; or enable a ring/aws-lc-rs feature."
         );
     }
 }
