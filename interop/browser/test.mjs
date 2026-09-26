@@ -3,9 +3,10 @@ import http from "node:http";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
 import { createInterface } from "node:readline";
+import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 
-const repository = new URL("../..", import.meta.url).pathname;
+const repository = fileURLToPath(new URL("../..", import.meta.url));
 const server = spawn(
   "cargo",
   ["run", "--quiet", "--manifest-path", "interop/Cargo.toml", "--bin", "chromium_server"],
