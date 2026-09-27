@@ -981,9 +981,9 @@ dependencies = [
 
 [[package]]
 name = "quion"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d4f6ebc3ba6f7c9bff2496f1c6579f0b33700ea514c101d9ca8d168ceab6f7cd"
+checksum = "afb1343db483f6da1b59f7222b9a06dee7e29a1dcce92bf0d68917b3938ce0e6"
 dependencies = [
  "bytes",
  "hmac",
@@ -1003,9 +1003,9 @@ dependencies = [
 
 [[package]]
 name = "quion-proto"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f96d35b42f5cdefa46a76f577b3306a2e68694584d27025813f191895003b729"
+checksum = "7a7df2fedc4f3224bff45fed34a71386f5b435bb0918dfef2707f6cbfff341b6"
 dependencies = [
  "aes-gcm",
  "bytes",
@@ -1023,9 +1023,9 @@ dependencies = [
 
 [[package]]
 name = "quion-udp"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b7fd68e59388a473df9582087dbdad3f07dfe2312d6235fa8df85ef70541b1"
+checksum = "a39af57c6472494928547f8eb07c7ed129e3912b2599b3294a332d8b04912c94"
 dependencies = [
  "libc",
  "smallvec",

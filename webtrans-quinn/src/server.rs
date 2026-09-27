@@ -174,6 +174,7 @@ impl Server {
         }
     }
 
+    #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
     fn with_accept_limits(
         endpoint: quinn::Endpoint,
         handshake_timeout: Option<Duration>,

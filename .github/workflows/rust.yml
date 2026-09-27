@@ -28,8 +28,14 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Test
         run: cargo test --workspace --locked
+      - name: Check both native backends
+        run: cargo check -p webtrans --all-features --all-targets --locked
 
-  quion:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: [quinn, quion]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,13 +43,11 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
-      - name: Check Quion facade and examples
-        run: cargo check -p webtrans --no-default-features --features quion --all-targets --locked
-      - name: Check both native backends
-        run: cargo check -p webtrans --all-features --all-targets --locked
+      - name: Check native facade and examples
+        run: cargo check -p webtrans --no-default-features --features ${{ matrix.backend }} --all-targets --locked
       - name: Check manual crypto configuration
-        run: cargo check -p webtrans-quion --no-default-features --locked
+        run: cargo check -p webtrans-${{ matrix.backend }} --no-default-features --locked
       - name: Test AWS-LC crypto
-        run: cargo test -p webtrans-quion --no-default-features --features aws-lc-rs --locked
-      - name: Check browser facade with Quion selected
-        run: cargo check -p webtrans --no-default-features --features quion --target wasm32-unknown-unknown --locked
+        run: cargo test -p webtrans-${{ matrix.backend }} --no-default-features --features aws-lc-rs --locked
+      - name: Check browser facade
+        run: cargo check -p webtrans --no-default-features --features ${{ matrix.backend }} --target wasm32-unknown-unknown --locked

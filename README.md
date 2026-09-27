@@ -18,7 +18,7 @@ fully draft-16 compliant. Native applications can inspect
 `webtrans_quinn::RESET_STREAM_AT_SUPPORTED`; it remains `false` until Quinn
 provides the required transport extension.
 
-The Quion backend uses Quion 0.2.0 and enables RESET_STREAM_AT by default.
+The Quion backend uses Quion 0.2.1 and enables RESET_STREAM_AT by default.
 `webtrans_quion::RESET_STREAM_AT_SUPPORTED` reports transport capability;
 `Session::reset_stream_at_negotiated()` reports the actual peer negotiation.
 Without negotiation, resets fall back to RESET_STREAM for compatibility.
