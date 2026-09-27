@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
-use webtrans_quinn::ServerBuilder;
-use webtrans_quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use backend::ServerBuilder;
+use backend::rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use webtrans_interop::native as backend;
 use wtransport::Identity;
 use wtransport::tls::Sha256DigestFmt;
 
@@ -32,7 +33,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn next_request(server: &mut webtrans_quinn::Server) -> Result<webtrans_quinn::Request> {
+async fn next_request(server: &mut backend::Server) -> Result<backend::Request> {
     server
         .accept()
         .await
@@ -40,7 +41,7 @@ async fn next_request(server: &mut webtrans_quinn::Server) -> Result<webtrans_qu
         .map_err(Into::into)
 }
 
-async fn serve_echo(server: &mut webtrans_quinn::Server) -> Result<()> {
+async fn serve_echo(server: &mut backend::Server) -> Result<()> {
     let request = next_request(server).await?;
     if request.url().path() != "/echo" {
         bail!("expected /echo, got {}", request.url());
@@ -65,7 +66,7 @@ async fn serve_echo(server: &mut webtrans_quinn::Server) -> Result<()> {
     Ok(())
 }
 
-async fn serve_close(server: &mut webtrans_quinn::Server) -> Result<()> {
+async fn serve_close(server: &mut backend::Server) -> Result<()> {
     let request = next_request(server).await?;
     if request.url().path() != "/server-close" {
         bail!("expected /server-close, got {}", request.url());
@@ -75,13 +76,11 @@ async fn serve_close(server: &mut webtrans_quinn::Server) -> Result<()> {
     Ok(())
 }
 
-async fn serve_rejection(server: &mut webtrans_quinn::Server) -> Result<()> {
+async fn serve_rejection(server: &mut backend::Server) -> Result<()> {
     let request = next_request(server).await?;
     if request.url().path() != "/reject" {
         bail!("expected /reject, got {}", request.url());
     }
-    request
-        .close(webtrans_quinn::http::StatusCode::FORBIDDEN)
-        .await?;
+    request.close(backend::http::StatusCode::FORBIDDEN).await?;
     Ok(())
 }

@@ -56,7 +56,7 @@ fn get_session() -> Result<Session, JsValue> {
 fn parse_hex_bytes(input: &str) -> Result<Vec<u8>, JsValue> {
     let s: String = input.chars().filter(|c| c.is_ascii_hexdigit()).collect();
 
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(JsValue::from_str("hex length must be even"));
     }
 

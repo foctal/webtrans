@@ -15,15 +15,21 @@ license = "MIT"
 webtrans-proto = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-webtrans-quinn = { workspace = true }
+webtrans-quinn = { workspace = true, optional = true }
+webtrans-quion = { workspace = true, optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 webtrans-wasm = { workspace = true }
 
+[features]
+default = ["quinn"]
+quinn = ["dep:webtrans-quinn"]
+quion = ["dep:webtrans-quion"]
+
 [dev-dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-rustls = { version = "0.23", default-features = false, features = ["logging", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["logging", "std"] }
 tokio = { version = "1", features = ["full"] }
 tracing = { workspace = true }
 tracing-subscriber = "0.3"

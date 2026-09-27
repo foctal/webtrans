@@ -9,8 +9,12 @@ anyhow = "1"
 bytes = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
 url = "2"
+webtrans-quion = { path = "../webtrans-quion", optional = true }
 webtrans-quinn = { path = "../webtrans-quinn" }
 wtransport = { version = "0.7.1", features = ["dangerous-configuration"] }
+
+[features]
+quion = ["dep:webtrans-quion"]
 
 [workspace]
 members = ["."]

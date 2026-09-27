@@ -5,15 +5,21 @@ on:
 
 jobs:
   independent:
+    strategy:
+      matrix:
+        backend: [quinn, quion]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Test independent native implementation
-        run: cargo test --manifest-path interop/Cargo.toml
+        run: cargo test --manifest-path interop/Cargo.toml --locked ${{ matrix.backend == 'quion' && '--features quion' || '' }}
 
   chromium:
+    strategy:
+      matrix:
+        backend: [quinn, quion]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,4 +35,6 @@ jobs:
           npx playwright install --with-deps chromium
       - name: Test current Chromium
         working-directory: interop/browser
+        env:
+          WEBTRANS_BACKEND: ${{ matrix.backend }}
         run: npm test

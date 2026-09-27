@@ -1,6 +1,5 @@
-//! Server-side helpers for WebTransport over Quinn.
+//! Server-side helpers for WebTransport over Quion.
 
-#[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
 use std::sync::Arc;
 use std::{num::NonZeroUsize, time::Duration};
 
@@ -20,7 +19,7 @@ use crate::{Connect, ServerError, Session, Settings};
 pub struct ServerBuilder {
     provider: crypto::Provider,
     addr: std::net::SocketAddr,
-    transport: quinn::TransportConfig,
+    transport: quion::TransportConfig,
     handshake_timeout: Option<Duration>,
     max_pending_handshakes: NonZeroUsize,
 }
@@ -39,7 +38,7 @@ impl ServerBuilder {
         Self {
             provider: crypto::default_provider(),
             addr: std::net::SocketAddr::from(([0_u16; 8], 443)),
-            transport: quinn::TransportConfig::default(),
+            transport: crate::default_transport_config(),
             handshake_timeout: None,
             max_pending_handshakes: NonZeroUsize::MAX,
         }
@@ -52,26 +51,22 @@ impl ServerBuilder {
 
     /// Enable the specified congestion controller.
     pub fn with_congestion_control(mut self, algorithm: CongestionControl) -> Self {
-        match algorithm {
-            CongestionControl::LowLatency => self.transport.congestion_controller_factory(
-                Arc::new(quinn::congestion::NewRenoConfig::default()),
-            ),
-            CongestionControl::Throughput => self
-                .transport
-                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default())),
-            CongestionControl::Default => self
-                .transport
-                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default())),
-        };
+        self.transport.set_congestion_algorithm(match algorithm {
+            CongestionControl::Default | CongestionControl::LowLatency => {
+                quion::CongestionAlgorithm::NewReno
+            }
+            CongestionControl::Throughput => quion::CongestionAlgorithm::Cubic,
+        });
 
         self
     }
 
     /// Replace the QUIC transport configuration.
     ///
-    /// Use this to bound receive windows, concurrent streams, datagram buffers,
+    /// Use this to bound receive windows, stream admission, datagram buffers,
     /// idle time, and other per-connection resources.
-    pub fn with_transport_config(mut self, transport: quinn::TransportConfig) -> Self {
+    /// This also replaces the default datagram and RESET_STREAM_AT settings.
+    pub fn with_transport_config(mut self, transport: quion::TransportConfig) -> Self {
         self.transport = transport;
         self
     }
@@ -101,17 +96,16 @@ impl ServerBuilder {
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()]; // Required ALPN.
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config
-            .try_into()
-            .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-        config.transport_config(Arc::new(self.transport));
+        let config = quion::ServerConfig::builder()
+            .with_rustls_config(config)
+            .with_transport_config(self.transport)
+            .build()?;
+        let server = quion::Endpoint::server(config, self.addr)?;
 
-        let server = quinn::Endpoint::server(config, self.addr)
-            .map_err(|e| ServerError::IoError(e.into()))?;
-
+        let driver = Arc::new(server.spawn_default_server_udp_driver(65_535)?);
         Ok(Server::with_accept_limits(
             server,
+            driver,
             self.handshake_timeout,
             self.max_pending_handshakes,
         ))
@@ -136,17 +130,16 @@ impl ServerBuilder {
 
         config.alpn_protocols = vec![crate::ALPN.as_bytes().to_vec()];
 
-        let config: quinn::crypto::rustls::QuicServerConfig = config
-            .try_into()
-            .map_err(|_| ServerError::InvalidCryptoConfiguration)?;
-        let mut config = quinn::ServerConfig::with_crypto(Arc::new(config));
-        config.transport_config(Arc::new(self.transport));
+        let config = quion::ServerConfig::builder()
+            .with_rustls_config(config)
+            .with_transport_config(self.transport)
+            .build()?;
+        let server = quion::Endpoint::server(config, self.addr)?;
 
-        let server = quinn::Endpoint::server(config, self.addr)
-            .map_err(|e| ServerError::IoError(e.into()))?;
-
+        let driver = Arc::new(server.spawn_default_server_udp_driver(65_535)?);
         Ok(Server::with_accept_limits(
             server,
+            driver,
             self.handshake_timeout,
             self.max_pending_handshakes,
         ))
@@ -155,7 +148,8 @@ impl ServerBuilder {
 
 /// A WebTransport server that accepts new sessions.
 pub struct Server {
-    endpoint: quinn::Endpoint,
+    endpoint: quion::Endpoint,
+    driver: Option<Arc<dyn Send + Sync>>,
     accept: FuturesUnordered<BoxFuture<'static, Result<Request, ServerError>>>,
     handshake_timeout: Option<Duration>,
     max_pending_handshakes: NonZeroUsize,
@@ -164,10 +158,14 @@ pub struct Server {
 impl Server {
     /// Manually create a new server with a preconfigured endpoint.
     ///
+    /// The caller must keep the endpoint's UDP driver running. Builders manage
+    /// this driver automatically, including while accepted sessions remain alive.
+    ///
     /// NOTE: The ALPN must be set to `crate::ALPN` for WebTransport to work.
-    pub fn new(endpoint: quinn::Endpoint) -> Self {
+    pub fn new(endpoint: quion::Endpoint) -> Self {
         Self {
             endpoint,
+            driver: None,
             accept: Default::default(),
             handshake_timeout: None,
             max_pending_handshakes: NonZeroUsize::MAX,
@@ -176,12 +174,14 @@ impl Server {
 
     #[cfg(any(feature = "ring", feature = "aws-lc-rs"))]
     fn with_accept_limits(
-        endpoint: quinn::Endpoint,
+        endpoint: quion::Endpoint,
+        driver: Arc<dyn Send + Sync>,
         handshake_timeout: Option<Duration>,
         max_pending_handshakes: NonZeroUsize,
     ) -> Self {
         Self {
             endpoint,
+            driver: Some(driver),
             accept: Default::default(),
             handshake_timeout,
             max_pending_handshakes,
@@ -190,7 +190,7 @@ impl Server {
 
     /// Return the local address on which the server endpoint is listening.
     pub fn local_addr(&self) -> Result<std::net::SocketAddr, std::io::Error> {
-        self.endpoint.local_addr()
+        Ok(self.endpoint.local_addr())
     }
 
     /// Accept a new WebTransport session request from a client.
@@ -203,10 +203,13 @@ impl Server {
                 res = self.endpoint.accept(), if self.accept.len() < self.max_pending_handshakes.get() => {
                     let conn = res?;
                     let timeout = self.handshake_timeout;
+                    let driver = self.driver.clone();
                     self.accept.push(Box::pin(async move {
                         let handshake = async move {
                             let conn = conn.await?;
-                            Request::accept(conn).await
+                            let mut request = Request::accept(conn).await?;
+                            request.driver = driver;
+                            Ok(request)
                         };
                         match timeout {
                             Some(timeout) => tokio::time::timeout(timeout, handshake)
@@ -226,7 +229,8 @@ impl Server {
 
 /// A mostly complete WebTransport handshake awaiting server accept/reject based on URL.
 pub struct Request {
-    conn: Option<quinn::Connection>,
+    driver: Option<Arc<dyn Send + Sync>>,
+    conn: Option<quion::Connection>,
     settings: Option<Settings>,
     connect: Option<Connect>,
     url: Url,
@@ -234,7 +238,8 @@ pub struct Request {
 
 impl Request {
     /// Accept a new WebTransport session from a client.
-    pub async fn accept(conn: quinn::Connection) -> Result<Self, ServerError> {
+    pub async fn accept(conn: quion::Connection) -> Result<Self, ServerError> {
+        let guard = crate::HandshakeGuard::new(&conn);
         // Perform the HTTP/3 handshake by sending/receiving SETTINGS frames.
         let settings = Settings::connect(&conn, false).await?;
 
@@ -243,7 +248,9 @@ impl Request {
 
         // Return the request while retaining settings/connect streams.
         let url = connect.url().clone();
+        guard.complete();
         Ok(Self {
+            driver: None,
             conn: Some(conn),
             settings: Some(settings),
             connect: Some(connect),
@@ -271,7 +278,12 @@ impl Request {
             .settings
             .take()
             .ok_or(ServerError::RequestAlreadyCompleted)?;
-        Ok(Session::new(conn, settings, connect))
+        Ok(Session::with_driver(
+            conn,
+            settings,
+            connect,
+            self.driver.take(),
+        ))
     }
 
     /// Reject the session and return the provided HTTP status code.
@@ -294,6 +306,7 @@ impl Drop for Request {
         // Keep the handshake resources alive until the explicit response has
         // been sent. A dropped request is a server-side failure, not a silent
         // cancellation, so use 500 rather than making the client wait for EOF.
+        let driver = self.driver.take();
         let conn = self.conn.take();
         let settings = self.settings.take();
         let url = self.url.clone();
@@ -323,7 +336,7 @@ impl Drop for Request {
                     "automatically rejected dropped unanswered WebTransport request"
                 );
             }
-            drop((conn, settings));
+            drop((conn, settings, driver));
         });
     }
 }

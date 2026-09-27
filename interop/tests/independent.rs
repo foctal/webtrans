@@ -1,9 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
+use webtrans_interop::native as backend;
 
 use anyhow::{Context, Result, bail};
+use backend::{ServerBuilder, tls::generate_self_signed_pair_der};
 use webtrans_quinn::quinn::{self, VarInt as QuinnVarInt};
-use webtrans_quinn::{ServerBuilder, tls::generate_self_signed_pair_der};
 use wtransport::error::ConnectionError as IndependentConnectionError;
 use wtransport::{ClientConfig, Endpoint, VarInt};
 
@@ -31,9 +32,8 @@ async fn interoperates_with_wtransport_across_protocol_scenarios() -> Result<()>
             .context("timed out waiting for malformed peer")?
             .context("server closed while waiting for malformed peer")?;
         match malformed {
-            Err(webtrans_quinn::ServerError::SettingsError(
-                webtrans_quinn::SettingsError::ProtoError(error),
-            )) if error.to_string().contains("16 KiB") => {}
+            Err(backend::ServerError::SettingsError(backend::SettingsError::ProtoError(error)))
+                if error.to_string().contains("16 KiB") => {}
             Err(error) => bail!("unexpected malformed SETTINGS error: {error}"),
             Ok(_) => bail!("malformed SETTINGS unexpectedly produced a request"),
         }
@@ -76,7 +76,7 @@ async fn interoperates_with_wtransport_across_protocol_scenarios() -> Result<()>
     Ok(())
 }
 
-async fn serve_echo(server: &mut webtrans_quinn::Server) -> Result<()> {
+async fn serve_echo(server: &mut backend::Server) -> Result<()> {
     let request = tokio::time::timeout(TIMEOUT, server.accept())
         .await
         .context("timed out waiting for echo request")?
@@ -99,7 +99,7 @@ async fn serve_echo(server: &mut webtrans_quinn::Server) -> Result<()> {
     Ok(())
 }
 
-async fn serve_close(server: &mut webtrans_quinn::Server) -> Result<()> {
+async fn serve_close(server: &mut backend::Server) -> Result<()> {
     let request = tokio::time::timeout(TIMEOUT, server.accept())
         .await
         .context("timed out waiting for close request")?
@@ -110,15 +110,13 @@ async fn serve_close(server: &mut webtrans_quinn::Server) -> Result<()> {
     Ok(())
 }
 
-async fn serve_rejection(server: &mut webtrans_quinn::Server) -> Result<()> {
+async fn serve_rejection(server: &mut backend::Server) -> Result<()> {
     let request = tokio::time::timeout(TIMEOUT, server.accept())
         .await
         .context("timed out waiting for rejected request")?
         .context("server closed while waiting for rejected request")??;
     assert_eq!(request.url().path(), "/reject");
-    request
-        .close(webtrans_quinn::http::StatusCode::FORBIDDEN)
-        .await?;
+    request.close(backend::http::StatusCode::FORBIDDEN).await?;
     Ok(())
 }
 
@@ -154,16 +152,19 @@ async fn exercise_echo(
 
 async fn send_malformed_settings(
     addr: std::net::SocketAddr,
-    certs: Vec<webtrans_quinn::rustls::pki_types::CertificateDer<'static>>,
+    certs: Vec<backend::rustls::pki_types::CertificateDer<'static>>,
 ) -> Result<()> {
-    let mut roots = webtrans_quinn::rustls::RootCertStore::empty();
+    let mut roots = backend::rustls::RootCertStore::empty();
     for cert in certs {
         roots.add(cert)?;
     }
-    let mut tls = webtrans_quinn::rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![webtrans_quinn::ALPN.as_bytes().to_vec()];
+    let mut tls =
+        backend::rustls::ClientConfig::builder_with_provider(backend::crypto::default_provider())
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    tls.alpn_protocols = vec![backend::ALPN.as_bytes().to_vec()];
     let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)?;
     let config = quinn::ClientConfig::new(Arc::new(crypto));
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;

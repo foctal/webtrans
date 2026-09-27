@@ -5,7 +5,6 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use crate::grease::is_grease_value;
 use crate::{VarInt, VarIntUnexpectedEnd};
 
 // The draft (draft-ietf-webtrans-http3-06) specifies type 0x2843, which encodes as 0x68 0x43.
@@ -36,83 +35,79 @@ pub enum Capsule {
 
 impl Capsule {
     /// Decode one capsule from a complete in-memory buffer.
+    /// Unknown types, including reserved Capsule GREASE values, are returned
+    /// without interpreting their payload. The session layer may ignore them.
     pub fn decode<B: Buf>(buf: &mut B) -> Result<Self, CapsuleError> {
-        loop {
-            let typ = VarInt::decode(buf)?;
-            let length = VarInt::decode(buf)?;
+        let typ = VarInt::decode(buf)?;
+        let length = VarInt::decode(buf)?;
 
-            let mut payload = buf.take(length.into_inner() as usize);
-            if payload.remaining() > MAX_CLOSE_PAYLOAD_SIZE {
-                return Err(CapsuleError::MessageTooLong);
-            }
+        let length =
+            usize::try_from(length.into_inner()).map_err(|_| CapsuleError::MessageTooLong)?;
+        if length > MAX_CLOSE_PAYLOAD_SIZE {
+            return Err(CapsuleError::MessageTooLong);
+        }
+        let mut payload = buf.take(length);
 
-            if payload.remaining() < payload.limit() {
-                return Err(CapsuleError::UnexpectedEnd);
-            }
+        if payload.remaining() < payload.limit() {
+            return Err(CapsuleError::UnexpectedEnd);
+        }
 
-            match typ.into_inner() {
-                CLOSE_WEBTRANSPORT_SESSION_TYPE => {
-                    if payload.remaining() < 4 {
-                        return Err(CapsuleError::UnexpectedEnd);
-                    }
-
-                    let error_code = payload.get_u32();
-
-                    let message_len = payload.remaining();
-                    if message_len > MAX_MESSAGE_SIZE {
-                        return Err(CapsuleError::MessageTooLong);
-                    }
-
-                    let message_bytes = payload.copy_to_bytes(message_len);
-                    let error_message = String::from_utf8(message_bytes.to_vec())
-                        .map_err(|_| CapsuleError::InvalidUtf8)?;
-
-                    return Ok(Self::CloseWebTransportSession {
-                        code: error_code,
-                        reason: error_message,
-                    });
+        match typ.into_inner() {
+            CLOSE_WEBTRANSPORT_SESSION_TYPE => {
+                if payload.remaining() < 4 {
+                    return Err(CapsuleError::UnexpectedEnd);
                 }
-                t if is_grease(t) => continue,
-                _ => {
-                    let payload_bytes = payload.copy_to_bytes(payload.remaining());
-                    return Ok(Self::Unknown {
-                        typ,
-                        payload: payload_bytes,
-                    });
+
+                let error_code = payload.get_u32();
+
+                let message_len = payload.remaining();
+                if message_len > MAX_MESSAGE_SIZE {
+                    return Err(CapsuleError::MessageTooLong);
                 }
+
+                let message_bytes = payload.copy_to_bytes(message_len);
+                let error_message = String::from_utf8(message_bytes.to_vec())
+                    .map_err(|_| CapsuleError::InvalidUtf8)?;
+
+                Ok(Self::CloseWebTransportSession {
+                    code: error_code,
+                    reason: error_message,
+                })
+            }
+            _ => {
+                let payload_bytes = payload.copy_to_bytes(payload.remaining());
+                Ok(Self::Unknown {
+                    typ,
+                    payload: payload_bytes,
+                })
             }
         }
     }
 
     /// Read and decode one capsule from an async stream.
     pub async fn read<S: AsyncRead + Unpin>(stream: &mut S) -> Result<Self, CapsuleError> {
-        loop {
-            let typ = VarInt::read(stream)
-                .await
-                .map_err(|_| CapsuleError::UnexpectedEnd)?;
-            let length = VarInt::read(stream)
-                .await
-                .map_err(|_| CapsuleError::UnexpectedEnd)?;
-            let length =
-                usize::try_from(length.into_inner()).map_err(|_| CapsuleError::MessageTooLong)?;
-            if length > MAX_CLOSE_PAYLOAD_SIZE {
-                return Err(CapsuleError::MessageTooLong);
-            }
-
-            let mut payload = vec![0; length];
-            stream.read_exact(&mut payload).await?;
-            if is_grease(typ.into_inner()) {
-                continue;
-            }
-
-            let mut capsule = Vec::with_capacity(VarInt::MAX_SIZE * 2 + length);
-            typ.encode(&mut capsule);
-            VarInt::try_from(length)
-                .map_err(|_| CapsuleError::MessageTooLong)?
-                .encode(&mut capsule);
-            capsule.extend_from_slice(&payload);
-            return Self::decode(&mut capsule.as_slice());
+        let typ = VarInt::read(stream)
+            .await
+            .map_err(|_| CapsuleError::UnexpectedEnd)?;
+        let length = VarInt::read(stream)
+            .await
+            .map_err(|_| CapsuleError::UnexpectedEnd)?;
+        let length =
+            usize::try_from(length.into_inner()).map_err(|_| CapsuleError::MessageTooLong)?;
+        if length > MAX_CLOSE_PAYLOAD_SIZE {
+            return Err(CapsuleError::MessageTooLong);
         }
+
+        let mut payload = vec![0; length];
+        stream.read_exact(&mut payload).await?;
+
+        let mut capsule = Vec::with_capacity(VarInt::MAX_SIZE * 2 + length);
+        typ.encode(&mut capsule);
+        VarInt::try_from(length)
+            .map_err(|_| CapsuleError::MessageTooLong)?
+            .encode(&mut capsule);
+        capsule.extend_from_slice(&payload);
+        Self::decode(&mut capsule.as_slice())
     }
 
     /// Encode this capsule into the provided buffer.
@@ -170,10 +165,6 @@ impl Capsule {
     }
 }
 
-fn is_grease(val: u64) -> bool {
-    is_grease_value(val)
-}
-
 #[derive(Debug, Clone, thiserror::Error)]
 /// Errors returned by capsule encoding and decoding.
 pub enum CapsuleError {
@@ -212,6 +203,39 @@ impl From<std::io::Error> for CapsuleError {
 mod tests {
     use super::*;
     use bytes::Bytes;
+
+    #[test]
+    fn unknown_capsule_consumes_exactly_one_payload_even_for_grease_values() {
+        // HTTP/3 frame GREASE and Capsule GREASE use different namespaces.
+        for typ in [0x21, 0x17, 0x29 + 0x17] {
+            let unknown = Capsule::Unknown {
+                typ: VarInt::from_u64(typ).unwrap(),
+                payload: Bytes::from_static(&[0xff, 0xff, 0xff]),
+            };
+            let close = Capsule::CloseWebTransportSession {
+                code: 42,
+                reason: "done".into(),
+            };
+            let mut bytes = Vec::new();
+            unknown.encode(&mut bytes).unwrap();
+            close.encode(&mut bytes).unwrap();
+            let mut remaining = bytes.as_slice();
+            assert_eq!(Capsule::decode(&mut remaining).unwrap(), unknown);
+            assert_eq!(Capsule::decode(&mut remaining).unwrap(), close);
+            assert!(remaining.is_empty());
+        }
+    }
+
+    #[test]
+    fn oversized_capsule_lengths_are_rejected_before_platform_conversion() {
+        let mut bytes = Vec::new();
+        VarInt::from_u32(0x17).encode(&mut bytes);
+        VarInt::MAX.encode(&mut bytes);
+        assert!(matches!(
+            Capsule::decode(&mut bytes.as_slice()),
+            Err(CapsuleError::MessageTooLong)
+        ));
+    }
 
     #[test]
     fn test_close_webtransport_session_decode() {
