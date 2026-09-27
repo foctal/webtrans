@@ -32,7 +32,7 @@ availability can differ by browser and deployment environment.
 
 ```toml
 [dependencies]
-webtrans = "0.5"
+webtrans = "0.6"
 ```
 
 API documentation is available on [docs.rs][doc-url]. Depend directly on
@@ -45,7 +45,7 @@ Quinn remains the default native backend. Select Quion through the facade with:
 
 ```toml
 [dependencies]
-webtrans = { version = "0.5", default-features = false, features = ["quion"] }
+webtrans = { version = "0.6", default-features = false, features = ["quion"] }
 ```
 
 The same `webtrans::{ClientBuilder, ServerBuilder, Session}` entry points work
