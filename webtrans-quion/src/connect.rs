@@ -14,13 +14,13 @@ pub enum ConnectError {
     ProtoError(#[from] webtrans_proto::ConnectError),
 
     #[error("connection error")]
-    ConnectionError(#[from] quinn::ConnectionError),
+    ConnectionError(#[from] quion::ConnectionError),
 
     #[error("read error")]
-    ReadError(#[from] quinn::ReadError),
+    ReadError(#[from] quion::ReadError),
 
     #[error("write error")]
-    WriteError(#[from] quinn::WriteError),
+    WriteError(#[from] quion::WriteError),
 
     #[error("http error status: {0}")]
     ErrorStatus(http::StatusCode),
@@ -31,14 +31,14 @@ pub struct Connect {
     request: ConnectRequest,
 
     // Keep references to send/recv streams so they remain open until drop.
-    send: quinn::SendStream,
+    send: quion::SendStream,
 
     #[allow(dead_code)]
-    recv: quinn::RecvStream,
+    recv: quion::RecvStream,
 }
 
 impl Connect {
-    pub async fn accept(conn: &quinn::Connection) -> Result<Self, ConnectError> {
+    pub async fn accept(conn: &quion::Connection) -> Result<Self, ConnectError> {
         // Accept the stream used for the HTTP CONNECT request.
         // Any other request type is treated as an error.
         let (send, mut recv) = conn.accept_bi().await?;
@@ -77,7 +77,7 @@ impl Connect {
         Ok(())
     }
 
-    pub async fn open(conn: &quinn::Connection, url: Url) -> Result<Self, ConnectError> {
+    pub async fn open(conn: &quion::Connection, url: Url) -> Result<Self, ConnectError> {
         // Create a stream for sending the CONNECT request.
         let (mut send, mut recv) = conn.open_bi().await?;
 
@@ -104,7 +104,7 @@ impl Connect {
 
     // The session ID is the stream ID of the CONNECT request.
     pub fn session_id(&self) -> VarInt {
-        let stream_id = quinn::VarInt::from(self.send.id());
+        let stream_id = self.send.id().expect("connected streams have IDs").0;
         VarInt::try_from(stream_id.into_inner()).unwrap()
     }
 
@@ -113,7 +113,7 @@ impl Connect {
         &self.request.url
     }
 
-    pub(super) fn into_inner(self) -> (quinn::SendStream, quinn::RecvStream) {
+    pub(super) fn into_inner(self) -> (quion::SendStream, quion::RecvStream) {
         (self.send, self.recv)
     }
 }

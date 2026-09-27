@@ -9,7 +9,12 @@ import { chromium } from "playwright";
 const repository = fileURLToPath(new URL("../..", import.meta.url));
 const server = spawn(
   "cargo",
-  ["run", "--quiet", "--manifest-path", "interop/Cargo.toml", "--bin", "chromium_server"],
+  [
+    "run", "--quiet", "--locked",
+    "--manifest-path", "interop/Cargo.toml",
+    "--bin", "chromium_server",
+    ...(process.env.WEBTRANS_BACKEND === "quion" ? ["--features", "quion"] : []),
+  ],
   { cwd: repository, stdio: ["ignore", "pipe", "inherit"] },
 );
 
